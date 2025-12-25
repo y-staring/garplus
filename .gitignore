@@ -10,3 +10,6 @@ checkpoints/
 logs/
 wandb/
 *.Identifier
+# large datasets
+GNN/code/biogrid_positive_edges.csv
+GNN/code/biogrid_positive_edges_expanded.csv
