@@ -1,0 +1,56 @@
+# @package _global_
+
+general:
+    # 这个名字会用在输出目录、wandb 等地方
+    name : 'epinions'
+
+    # 用几块 GPU（你之前是 1 块）
+    gpus : 1
+    precision: 16
+    # 先关掉 wandb，等你配置好 API key 再改成 'online'
+    wandb: 'disabled'
+
+    # 训练 / 测试控制
+    resume: null            # 继续训练时填 ckpt 路径（相对 outputs 根目录）
+    test_only: null         # 只测试某个 ckpt 时填 ckpt 路径
+
+    # 验证 & 采样频率
+    check_val_every_n_epochs: 20   # 每 50 个 epoch 做一次验证
+    sample_every_val: 5           # 每 10 次验证做一次采样
+
+    # 每次采样时生成/保存多少图
+    samples_to_generate: 8        # 每次采样生成 32 张图
+    samples_to_save: 8            # 全部都存下来
+    chains_to_save: 1              # 保存 2 条扩散链动画
+
+    # 日志
+    log_every_steps: 50
+
+    # 采样时 gif 的步数
+    number_chain_steps: 50
+
+    # 最终模型的额外采样（训练完之后）
+    final_model_samples_to_generate: 100
+    final_model_samples_to_save: 50
+    final_model_chains_to_save: 10
+
+
+train:
+    # DiGress 原版就是给一个很大的 max epoch，用 early stop / 人工停
+    n_epochs: 100
+
+    batch_size: 64      # 如果显存不够可以改小一点，比如 64 / 128
+    save_model: True     # 保存最优 ckpt + last.ckpt
+
+
+model:
+    # 图 Transformer 的层数，和 comm20 保持一致
+    n_layers: 8
+
+    # 训练损失加权，原 repo 默认 [5, 0]
+    lambda_train: [5, 0]
+
+    # 对于 Epinions，我们前面 debug 是用 None 的（只用基础特征），
+    # ExtraFeatures 主要是给 SPECTRE 那几个数据集设计的，不一定完全匹配。
+    # 建议先设成 null，跑通再考虑加额外特征。
+    extra_features: null

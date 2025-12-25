@@ -1,0 +1,12 @@
+**/outputs/
+
+GNN/code/data
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+logs/
+wandb/
+*.Identifier

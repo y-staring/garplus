@@ -1,0 +1,14 @@
+# configs/dataset/epinions.yaml
+# 注意：这里不需要 # @package _global_，因为它的内容会自动挂载到 cfg.dataset 下
+
+name: epinions
+datadir: data/epinions  # 确保这个路径存在
+max_nodes: 10
+min_nodes: 3
+num_subgraphs: 2000     # 正常训练时的数量
+num_bins: 45           # 节点特征分箱
+neg_sample_ratio: 0.8
+
+# DataModule 需要的基础参数
+pin_memory: True
+num_workers: 0          # Debug 时设为 0 避免多进程死锁，正常训练可设为 4

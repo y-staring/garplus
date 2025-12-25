@@ -1,0 +1,100 @@
+# @package _global_
+# 继承 PPI 的基础配置，但下面会覆盖掉具体参数
+defaults:
+  - override /dataset: ppi
+  - override /model: discrete
+  - override /train: train_default
+
+general:
+  name : 'debug_ppi'
+  gpus : 0                # 强制使用 CPU，方便报错时看完整的堆栈信息 (CUDA报错有时不准)
+  wandb: 'disabled'       # 关掉日志上传
+  resume: null
+  test_only: null
+  
+  # === 验证与采样频率 (极其频繁，确保每个环节都测到) ===
+  check_val_every_n_epochs: 1
+  sample_every_val: 1
+  samples_to_generate: 2
+  samples_to_save: 2
+  chains_to_save: 1
+  log_every_steps: 1
+  number_chain_steps: 5   # GIF 只有5帧
+  
+  final_model_samples_to_generate: 2
+  final_model_samples_to_save: 2
+  final_model_chains_to_save: 1
+
+train:
+  n_epochs: 2             # 跑两轮就退
+  batch_size: 2           # 极小 Batch
+  save_model: False       # 不保存权重文件
+  num_workers: 0          # ★★★ 调试时必须为0，避免多进程死锁看不到报错
+
+model:
+  n_layers: 2             # 只有2层 Transformer
+  diffusion_steps: 10     # 只有10步扩散
+  diffusion_noise_schedule: 'cosine'
+  
+  # ★★★ 调试时建议先关掉复杂特征，先测通数据流 ★★★
+  # 如果想测特征计算是否有 bug，这里可以改为 'all'
+  extra_features: null    
+  
+  # ★★★ 极小的网络维度，防止 OOM 并加速 ★★★
+  hidden_mlp_dims: { 'X': 32, 'E': 16, 'y': 32 }
+  hidden_dims: { 'dx': 32, 'de': 16, 'dy': 32, 'n_head': 2, 'dim_ffX': 32, 'dim_ffE': 32, 'dim_ffy': 32 }
+  
+  # Loss 权重 (随便设，只要能跑通就行)
+  lambda_train: [1, 1]
+
+dataset:
+  # ★★★ 强制覆盖 PPI 数据集参数，只生成极少量数据 ★★★
+  # 注意：这需要你的 PPIDataModule 代码能读取这些参数 (见下文修改建议)
+  num_subgraphs: 100       # 只采样 20 个子图用于训练
+  min_nodes: 5
+  max_nodes: 15           # 图非常小
+  batch_size: 2
+  num_workers: 0
+  pin_memory: False
+
+
+
+
+
+
+
+
+
+
+#for epinions
+# general:
+#     name : 'debug'
+#     gpus : 0
+#     wandb: 'disabled'
+#     sample_every_val: 1
+#     samples_to_generate: 2
+#     samples_to_save: 2
+#     chains_to_save: 1
+#     # remove_h: True # 非分子图任务通常不需要这个，可以注释掉
+#     number_chain_steps: 10
+    
+# train:
+#     batch_size: 4
+#     save_model: False
+#     n_epochs: 2 # Debug 跑两轮就够了
+
+# model:
+#     n_layers: 2
+#     diffusion_steps: 20
+#     # ★★★ 建议注释掉下面这两行，使用模型默认的 hidden dims，
+#     # 否则这里的 17 可能跟你的 input_dims (10) 冲突导致报错
+#     # hidden_mlp_dims: {'X': 32, 'E': 32, 'y': 32}
+#     # hidden_dims: {'dx': 32, 'de': 32, 'dy': 32, 'n_head': 4, 'dim_ffX': 32, 'dim_ffE': 32, 'dim_ffy': 32}
+    
+#     extra_features: null 
+
+# # ★★★ 新增：强制覆盖 Dataset 参数，确保 Debug 秒级运行
+# dataset:
+#     num_subgraphs: 10
+#     num_bins: 10     # 减少特征维度方便快速测试
+#     batch_size: 4
