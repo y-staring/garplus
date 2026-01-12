@@ -125,7 +125,7 @@ def eigval_stats(eig_ref_list, eig_pred_list, max_eig=20, is_parallel=True, comp
             spectral_temp = get_spectral_pmf(eig_pred_list[i])
             sample_pred.append(spectral_temp)
 
-    # mmd_dist = compute_mmd(sample_ref, sample_pred, kernel=gaussian_emd)
+    # _dist = compute_mmd(sample_ref, sample_pred, kernel=gaussian_emd)
     if compute_emd:
         mmd_dist = compute_mmd(sample_ref, sample_pred, kernel=emd)
     else:
