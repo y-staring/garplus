@@ -103,6 +103,9 @@ class AbstractDatasetInfos:
         example_batch = next(iter(datamodule.train_dataloader()))
         ex_dense, node_mask = utils.to_dense(example_batch.x, example_batch.edge_index, example_batch.edge_attr,
                                              example_batch.batch)
+        
+        print(">>> Dense E shape:", ex_dense.E.shape)
+        print(">>> Edge channel dim (De):", ex_dense.E.shape[-1])
         example_data = {'X_t': ex_dense.X, 'E_t': ex_dense.E, 'y_t': example_batch['y'], 'node_mask': node_mask}
 
         self.input_dims = {'X': example_batch['x'].size(1),

@@ -174,6 +174,32 @@ def main(cfg: DictConfig):
         # 所有路径和采样参数逻辑都在 PPIDataModule.__init__ 内部处理
         datamodule = PPIDataModule(cfg)
 
+        #========================================
+        from collections import Counter
+        import torch
+
+        def count_bitmasks(dataloader, max_batches=None):
+            cnt = Counter()
+            for bi, data in enumerate(dataloader):
+                if hasattr(data, "edge_label_mask"):
+                    masks = data.edge_label_mask.detach().cpu().tolist()
+                    cnt.update(masks)
+                else:
+                    raise ValueError("Batch里没有 edge_label_mask；你需要在Dataset里保留它。")
+
+                if max_batches is not None and (bi + 1) >= max_batches:
+                    break
+
+            print("\n==== Bitmask stats ====")
+            print("不同 bitmask（谓词组合）数量 =", len(cnt))
+            print("总边数 =", sum(cnt.values()))
+            print("最常见的 10 种 bitmask =", cnt.most_common(10))
+            return cnt
+
+        train_loader = datamodule.train_dataloader()
+
+        cnt = count_bitmasks(train_loader) 
+        # ===================================================
         # 2. 初始化 Dataset Infos (负责统计节点类型分布、边类型分布等)
         dataset_infos = PPIDatasetInfos(datamodule, dataset_config)
 
