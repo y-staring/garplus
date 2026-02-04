@@ -51,8 +51,8 @@ dataset:
   # ★★★ 强制覆盖 PPI 数据集参数，只生成极少量数据 ★★★
   # 注意：这需要你的 PPIDataModule 代码能读取这些参数 (见下文修改建议)
   num_subgraphs: 100       # 只采样 20 个子图用于训练
-  min_nodes: 5
-  max_nodes: 15           # 图非常小
+  min_nodes: 3
+  max_nodes: 5        # 图非常小
   batch_size: 2
   num_workers: 0
   pin_memory: False

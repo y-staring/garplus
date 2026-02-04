@@ -211,12 +211,13 @@ class NonMolecularVisualization:
     
         for u, v, data in graph.edges(data=True):
             et = int(data.get("color", 0))  # 0,1,2
-            if et == 1 or et==2:
-                pos_edges.append((u, v))
-            elif et == 3 or et==4:
+            # print(et)
+            is_neg = ((et -1)&1) != 0
+            # if et == 1 or et==2:
+            if is_neg:
                 neg_edges.append((u, v))
             else:
-                other_edges.append((u, v))
+                pos_edges.append((u, v))
     
         # 正边：黑色，实线
         if len(pos_edges) > 0:

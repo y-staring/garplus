@@ -64,6 +64,23 @@ class AbstractDataModule(LightningDataset):
             num_non_edges = all_pairs - num_edges
 
             edge_types = data.edge_attr.sum(dim=0)
+            # if num_non_edges < 0:
+            #     print("\n[EDGE_COUNT DEBUG] batch_id =", i)
+            #     print(" node_count_per_graph =", counts.tolist())
+            #     print(" all_pairs =", all_pairs)
+            #     print(" num_edges =", int(num_edges))
+            #     # 检查 self-loop 数量
+            #     self_loops = (data.edge_index[0] == data.edge_index[1]).sum().item()
+            #     print(" self_loops =", self_loops)
+            #     # 检查重复有向边数量
+            #     pairs = data.edge_index.t()
+            #     num_unique = torch.unique(pairs, dim=0).shape[0]
+            #     print(" unique_directed_edges =", int(num_unique))
+            #     print(" duplicated_directed_edges =", int(num_edges) - int(num_unique))
+            #     # 也打印一下一个图的 n 和 E 大概量级
+            #     print(" max_n =", int(counts.max()))
+            #     print(" --------")
+            #     break
             assert num_non_edges >= 0
             d[0] += num_non_edges
             d[1:] += edge_types[1:]

@@ -227,6 +227,7 @@ def main(cfg: DictConfig):
         # 6. 采样指标 (Sampling Metrics)
         # SpectreSamplingMetrics 计算 Degree/Clustering/Orbit 等分布距离
         # compute_emd=True 会稍微慢一点但更准确，metrics_list 根据需要调整
+        #validty：没有太多边也没有太少边的比例（连通性和平面性）
         sampling_metrics = SpectreSamplingMetrics(
             datamodule, 
             compute_emd=True, 

@@ -42,9 +42,12 @@ class TimeLimit:
 # --- 验证相关常量 ---
 MATCH_LIMIT = 400  
 TIME_LIMIT = 5
-ML_THRESHOLD = 0.5
+ML_THRESHOLD = 0.3
 
 
+
+# --- [NEW] 节点特征编码映射 ---
+import pandas as pd
 
 # --- [NEW] 节点特征编码映射 ---
 NODE_BIT_MAP = {
@@ -52,44 +55,21 @@ NODE_BIT_MAP = {
     'is_disease_related': 1  # +2
 }
 
-# --- [NEW] 边特征编码映射 ---
+# --- [FIXED] 连续位的边特征编码映射（只保留你要的 key） ---
 EDGE_BIT_MAP = {
-    'location_match_y': 0,     # +1
-    'process_match_y': 1,      # +2
-    'M_GNN': 2,                # +4 (ML High Confidence)
-    'physical_interaction': 3, # +8
-    'genetic_interaction': 4,  # +16
-    'phosphorylation': 5,      # +32
-    'ubiquitination': 6,       # +64
-    "is_negative": 7           # +128 [NEW]
+    "is_negative": 0,           # +1  
+    "location_match_y": 1,      # +2
+    "M_sim": 2,                 # +4
+    "physical_interaction": 3,  # +8
+    "x_hub_degree": 4,          # +16
+    "x_low_betweenness": 5,     # +32
+    "Affinity_Capture_MS": 6,   # +64
 }
 
 
 # --- [MODIFIED] 特征维度定义 ---
-# 节点特征: 2 bit -> 4 类 (0-3)
-NUM_NODE_CLASSES = 4 
-# 边特征: 8 bit -> 256 类 (0-127)
-NUM_EDGE_CLASSES = 1 + (2 ** len(EDGE_BIT_MAP))  # 1+256=257
-
-
-def edge_bitmask_to_vector(bitmask: int) -> torch.Tensor:
-    """
-    将 8-bit bitmask (0..255) 转为 9维向量:
-    [no-edge, pred1, pred2, ..., pred8]
-    
-    对于真实存在的边：no-edge=0
-    对于 non-edge：由 encode_no_edge() 在 dense 图里自动填 no-edge=1
-    """
-    vec = torch.zeros(NUM_EDGE_CLASSES, dtype=torch.float)  # 9维
-    vec[0] = 0.0  # 真实边：no-edge 永远是 0
-    
-    # 注意：EDGE_BIT_MAP 的 key 顺序不保证稳定，建议按 bit 位排序
-    # 我们按 bit index 从小到大展开，保证维度语义固定
-    #bit 0对应第一维， 
-    for name, bit in sorted(EDGE_BIT_MAP.items(), key=lambda x: x[1]):
-        if bitmask & (1 << bit):
-            vec[1 + bit] = 1.0
-    return vec
+NUM_NODE_CLASSES = 4
+NUM_EDGE_CLASSES = 1 + (2 ** len(EDGE_BIT_MAP))  # 1 + 2^7 = 129
 
 
 # --- [NEW] 编码函数实现 ---
@@ -106,61 +86,93 @@ def encode_node_feature(node_attr: dict) -> int:
         n_feature |= (1 << NODE_BIT_MAP['is_disease_related'])
     return n_feature
 
-def encode_edge_feature(node_x_attr: dict, node_y_attr: dict, edge_row: dict) -> int:
-    """ 编码两个节点 (x, y) 及其边属性为整数特征 E (0-255) """
+def _norm_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def encode_edge_feature(
+    id_x,
+    id_y,
+    node_x_attr: dict,
+    node_y_attr: dict,
+    edge_row,
+    global_stats: dict,
+    sim_threshold: float = ML_THRESHOLD
+) -> int:
+    """
+    连续位 bitmask 编码（只使用 EDGE_BIT_MAP 里的 key）：
+      - location_match_y
+      - M_sim            (edge_row["ml_score"] > sim_threshold)
+      - physical_interaction
+      - is_negative
+      - x_hub_degree
+      - x_low_betweenness
+      - Affinity_Capture_MS
+    """
     e_feature = 0
-    
-    # --- A. 属性比较谓词 ---
-    loc_x_str = str(node_x_attr.get('Subcellular location [CC]', node_x_attr.get('location', '')))
-    loc_y_str = str(node_y_attr.get('Subcellular location [CC]', node_y_attr.get('location', '')))
-    loc_x = set(loc_x_str.split(';'))
-    loc_y = set(loc_y_str.split(';'))
-    loc_x.discard(''); loc_y.discard('')
-    
-    if len(loc_x.intersection(loc_y)) > 0:
-        e_feature |= (1 << EDGE_BIT_MAP['location_match_y'])
-        
-    # 2. process_match_y
-    proc_x = set(str(node_x_attr.get('Gene Ontology (biological process)', '')).split(';'))
-    proc_y = set(str(node_y_attr.get('Gene Ontology (biological process)', '')).split(';'))
-    proc_x.discard(''); proc_y.discard('')
-    if len(proc_x.intersection(proc_y)) > 0:
-        e_feature |= (1 << EDGE_BIT_MAP['process_match_y'])
 
-    # --- B. ML 谓词 & 实验谓词 (依赖 edge_row) ---
+    # A) location_match_y：canon 位置严格相等
+    loc_x = _norm_str(node_x_attr.get(
+        "canon_Subcellular_location_CC",
+        node_x_attr.get("Subcellular location [CC]", node_x_attr.get("location", ""))
+    ))
+    loc_y = _norm_str(node_y_attr.get(
+        "canon_Subcellular_location_CC",
+        node_y_attr.get("Subcellular location [CC]", node_y_attr.get("location", ""))
+    ))
+    if loc_x and (loc_x == loc_y):
+        e_feature |= (1 << EDGE_BIT_MAP["location_match_y"])
+
+    # B) x_hub_degree：x.degree >= global q75(degree)
+    try:
+        deg_x = float(node_x_attr.get("degree", 0.0))
+    except Exception:
+        deg_x = 0.0
+    q75_deg = float(global_stats.get("degree", {}).get("q75", float("inf")))
+    if deg_x >= q75_deg:
+        e_feature |= (1 << EDGE_BIT_MAP["x_hub_degree"])
+
+    # C) x_low_betweenness：x.betweenness <= global q25(betweenness)
+    try:
+        bet_x = float(node_x_attr.get("betweenness_centrality", 0.0))
+    except Exception:
+        bet_x = 0.0
+    q25_bet = float(global_stats.get("betweenness_centrality", {}).get("q25", float("-inf")))
+    if bet_x <= q25_bet:
+        e_feature |= (1 << EDGE_BIT_MAP["x_low_betweenness"])
+
+    # D/E) edge_row 相关邮票：M_sim / Affinity Capture-MS / physical / negative
     if edge_row:
-        # ML Predicate
+        # D) M_sim：看 ml_score 是否过阈值
         try:
-            score = float(edge_row.get('Score', 0.0))
-        except: 
-            score = 0.0
-        if score > ML_THRESHOLD:
-            e_feature |= (1 << EDGE_BIT_MAP['M_GNN'])
+            ml_score = float(edge_row.get("ml_score", 0.0))
+        except Exception:
+            ml_score = 0.0
+        if ml_score > sim_threshold:
+            e_feature |= (1 << EDGE_BIT_MAP["M_sim"])
 
-        raw_type = str(edge_row.get('type', 'positive')).lower() 
-        
-        # [MODIFIED] 负边判定逻辑
-        # 如果标签包含 negative，或者有单独的 is_negative 列
-        if 'negative' in raw_type or edge_row.get('is_negative') == True:
-            e_feature |= (1 << EDGE_BIT_MAP['is_negative']) # Bit 7 置 1
+        # E1) Affinity Capture-MS
+        exp_sys = _norm_str(edge_row.get("Experimental System", ""))
+        if exp_sys == "Affinity Capture-MS":
+            e_feature |= (1 << EDGE_BIT_MAP["Affinity_Capture_MS"])
 
-        # 3. 实验手段 (Physical/Genetic)
-        # 注意：即使是负边，通常也意味着“通过某种手段证实为负”，所以手段位依然可以是 1
-        # 例如：Y2H 实验显示不互作 -> physical=1, is_negative=1
-        sys_type = str(edge_row.get('Experimental System Type', raw_type)).lower()
-        if 'physical' in sys_type:
-            e_feature |= (1 << EDGE_BIT_MAP['physical_interaction'])
-        if 'genetic' in sys_type:
-            e_feature |= (1 << EDGE_BIT_MAP['genetic_interaction'])
-            
-        # PTM 修饰
-        mod_text = str(edge_row.get('Modification', '')).lower()
-        if 'phosphorylation' in mod_text:
-            e_feature |= (1 << EDGE_BIT_MAP['phosphorylation'])
-        if 'ubiquitin' in mod_text:
-            e_feature |= (1 << EDGE_BIT_MAP['ubiquitination'])
-            
-    return e_feature
+        # E2) physical_interaction
+        sys_type = str(edge_row.get("Experimental System Type", "")).lower()
+        if "physical" in sys_type:
+            e_feature |= (1 << EDGE_BIT_MAP["physical_interaction"])
+
+        # E3) is_negative
+        raw_type = str(edge_row.get("type", "positive")).lower()
+        if ("negative" in raw_type) or (edge_row.get("is_negative") is True):
+            e_feature |= (1 << EDGE_BIT_MAP["is_negative"])
+
+    return int(e_feature)
+
+
 
 # --- 辅助函数 ---
 def map_loc_to_category(loc_str):
@@ -265,7 +277,7 @@ def calculate_subgraph_metrics(subG, bigG):
 
 class PPIGraphDataset(InMemoryDataset):
     def __init__(self, root, split='train', transform=None, pre_transform=None, pre_filter=None, 
-                 num_subgraphs=2000, min_nodes=10, max_nodes=50):
+                 num_subgraphs=2000, min_nodes=3, max_nodes=5):
         self.num_subgraphs = num_subgraphs
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
@@ -310,44 +322,78 @@ class PPIGraphDataset(InMemoryDataset):
             print(f"Error loading metadata: {e}")
             return
 
-        # --- B. 构建大图 ---
+                # --- B. 构建大图 ---
         print(f"Loading PPI structure from {ppi_path}...")
         bigG = nx.Graph()
         try:
             df_ppi = pd.read_csv(ppi_path, sep=',' if ',' in open(ppi_path).readline() else '\t')
             df_ppi.columns = df_ppi.columns.str.strip()
-            
+
+            # 第一遍：只加点、加边，边 label 先占位 0
             for _, row in df_ppi.iterrows():
                 u_bid = str(row.get('BioGRID ID Interactor A', '')).split('.')[0]
                 v_bid = str(row.get('BioGRID ID Interactor B', '')).split('.')[0]
-                if not u_bid or not v_bid: continue
-                
+                if not u_bid or not v_bid:
+                    continue
+
                 u_attrs = id_to_attrs.get(u_bid, {})
                 v_attrs = id_to_attrs.get(v_bid, {})
-                
-                # [MODIFIED] 使用新编码器生成 feature_val
+
+                # 节点特征编码（你已有逻辑）
                 u_enc = encode_node_feature(u_attrs)
                 v_enc = encode_node_feature(v_attrs)
-                
-                # 添加节点 (feature_val 是关键训练特征)
+
+                # 添加节点
                 bigG.add_node(u_bid, **u_attrs, feature_val=u_enc)
                 bigG.add_node(v_bid, **v_attrs, feature_val=v_enc)
-                
+
                 edge_data = row.to_dict()
-                
-                # [MODIFIED] 使用新编码器生成边 label (0-255)
-                # 这一步非常关键！原来的 get_gar_edge_index 被替换了
-                edge_label_enc = encode_edge_feature(u_attrs, v_attrs, edge_data)
-                
-                bigG.add_edge(u_bid, v_bid, label=edge_label_enc, **edge_data)
-                
+
+                # 先占位，第二遍再用全局统计 + GNN + Affinity Capture-MS 规则重算
+                bigG.add_edge(u_bid, v_bid, label=0, **edge_data)
+
+            # --- B2. 计算节点统计量与全局分位数（给 x.degree / x.betweenness 的谓词用）---
+            deg_dict = dict(bigG.degree())
+            nx.set_node_attributes(bigG, deg_dict, "degree")
+
+            bet_dict = nx.betweenness_centrality(bigG,k=256,seed=42)
+            nx.set_node_attributes(bigG, bet_dict, "betweenness_centrality")
+
+            deg_vals = np.array(list(deg_dict.values()), dtype=float)
+            bet_vals = np.array(list(bet_dict.values()), dtype=float)
+            global_stats = {
+                "degree": {"q75": float(np.quantile(deg_vals, 0.75))},
+                "betweenness_centrality": {"q25": float(np.quantile(bet_vals, 0.25))}
+            }
+
+            # --- B3. 准备 pred_scores（没有就先空着，不会影响流程）---
+            pred_scores = {"GNN": {}}
+            GNN_THRESHOLD = 0.5
+
+            # --- B4. 第二遍：重算边 label（严格按你的谓词策略）---
+            for u, v, d in bigG.edges(data=True):
+                ux = bigG.nodes[u]
+                vy = bigG.nodes[v]
+                d["label"] = int(
+                    encode_edge_feature(
+                        id_x=u,
+                        id_y=v,
+                        node_x_attr=ux,
+                        node_y_attr=vy,
+                        edge_row=d,
+                        global_stats=global_stats
+                    )
+
+                )
+
         except Exception as e:
             print(f"Error building graph: {e}")
             import traceback
             traceback.print_exc()
             return
-            
+
         print(f"Big Graph loaded. Nodes: {bigG.number_of_nodes()}, Edges: {bigG.number_of_edges()}")
+
     
         # --- C. 扫描负边 ---
         neg_edge_nodes = set()
@@ -441,46 +487,78 @@ class PPIGraphDataset(InMemoryDataset):
         x_idx = torch.tensor(xs, dtype=torch.long)
         x = F.one_hot(x_idx, num_classes=NUM_NODE_CLASSES).float()  # [n, 4]
 
-        # 2) 边特征：bitmask -> categorical edge type (0:no-edge, 1..256: bitmask+1)
+        # 2) 构造有向边 + 特征
         src, dst = [], []
         edge_type_ids = []
-        edge_bitmasks = []  # debug：保留原始 bitmask (0..255)
+        edge_bitmasks = []
 
+        # 先收集所有“候选 directed edges”
+        cand = []  # (s, t, edge_type, bitmask)
         for u, v, d in G.edges(data=True):
-            bitmask = int(d.get('label', 0))          # 0..255 (组合)
-            edge_type = bitmask + 1                   # 1..256 (预留 0 给 no-edge)
+            bitmask = int(d.get('label', 0))     # 0..(2^k-1)
+            edge_type = bitmask + 1              # 1.. (预留 0 给 no-edge)
 
-            # 无向边 -> 双向有向边
-            src.extend([u, v])
-            dst.extend([v, u])
-            edge_type_ids.extend([edge_type, edge_type])
-            edge_bitmasks.extend([bitmask, bitmask])
+            # 无向 -> 双向
+            cand.append((u, v, edge_type, bitmask))
+            cand.append((v, u, edge_type, bitmask))
 
-        if not src:
+        if not cand:
             return None
 
-        edge_index = torch.tensor([src, dst], dtype=torch.long)           # [2, 2E]
-        edge_type_ids = torch.tensor(edge_type_ids, dtype=torch.long)     # [2E]
-        edge_attr = F.one_hot(edge_type_ids, num_classes=NUM_EDGE_CLASSES).float()  # [2E, 257]
+        # 2.1) 去 self-loop + 去重 directed edge
+        seen = set()
+        dup = 0
+        self_loops = 0
 
-        # 采样得到的 dense E[i,j] 是类别 id（collapse 后）：
+        for s, t, et, bm in cand:
+            s = int(s); t = int(t)
+            if s == t:
+                self_loops += 1
+                continue
 
-        # 0 → no-edge
+            key = (s, t)
+            if key in seen:
+                dup += 1
+                continue
+            seen.add(key)
 
-        # k (1..256) → bitmask = k - 1
+            src.append(s)
+            dst.append(t)
+            edge_type_ids.append(int(et))
+            edge_bitmasks.append(int(bm))
 
-        # 然后你可以用你之前的 EDGE_BIT_MAP 反解每一位是不是 1。bitmask=1表示没有谓词组合匹配
-        edge_label_mask = torch.tensor(edge_bitmasks, dtype=torch.long)   # [2E] 可选保留 debug
+        if len(src) == 0:
+            return None
+
+        if self_loops > 0:
+            print(f"[WARN] removed self-loops: {self_loops}")
+        if dup > 0:
+            print(f"[WARN] duplicate directed edges removed: {dup}")
+
+        # 2.2) 组装 PyG 张量
+        edge_index = torch.tensor([src, dst], dtype=torch.long)  # [2, E]
+        edge_type_ids = torch.tensor(edge_type_ids, dtype=torch.long)  # [E]
+        edge_attr = F.one_hot(edge_type_ids, num_classes=NUM_EDGE_CLASSES).float()  # [E, 129] 你这边是129
+
+        edge_label_mask = torch.tensor(edge_bitmasks, dtype=torch.long)  # [E] debug
+
+        # 3) 最后再做一道硬检查：保证不会出现 num_edges > n*(n-1)
+        n = G.number_of_nodes()
+        if edge_index.size(1) > n * (n - 1):
+            # 理论上去重+去自环后不可能发生
+            print(f"[FATAL] edges > n*(n-1): n={n}, E={edge_index.size(1)}")
+            return None
 
         y = torch.zeros(1, 0).float()
         return Data(
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
-            edge_label_mask=edge_label_mask,  # 仍然保存原bitmask（方便你还原谓词）
-            n_nodes=G.number_of_nodes(),
+            edge_label_mask=edge_label_mask,
+            n_nodes=n,
             y=y
         )
+
 
 
 
