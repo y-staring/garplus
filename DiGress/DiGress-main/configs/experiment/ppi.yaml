@@ -8,7 +8,7 @@ general:
   test_only: null
   
   # === 验证与采样频率 ===
-  check_val_every_n_epochs: 50   # 每 50 个 epoch 验证一次
+  check_val_every_n_epochs: 500   # 每 50 个 epoch 验证一次
   sample_every_val: 10           # 每 10 次验证采样一次 (即每 500 epochs)
   samples_to_generate: 20        # 验证时生成的图数量
   samples_to_save: 20            # 保存到硬盘的数量

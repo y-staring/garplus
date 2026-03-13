@@ -165,7 +165,8 @@ def main(cfg: DictConfig):
         # ---------------------------------------------------------
         # ★★★ PPI Dataset Configuration for GAR+ ★★★
         # ---------------------------------------------------------
-        from datasets.ppi_dataset import PPIDataModule, PPIDatasetInfos  # 修正导入名称
+        # from datasets.ppi_dataset import PPIDataModule, PPIDatasetInfos  # 修正导入名称
+        from datasets.ppi_dataset_order_embedding import PPIDataModule, PPIDatasetInfos  # 修正导入名称
         from analysis.visualization import NonMolecularVisualization
         from metrics.abstract_metrics import TrainAbstractMetricsDiscrete, TrainAbstractMetrics
         from analysis.spectre_utils import SpectreSamplingMetrics

@@ -1,16 +1,27 @@
 import os
+import math
+import random
+import signal
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import networkx as nx
-import torch.nn.functional as F
-from torch_geometric.data import Data, InMemoryDataset
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
-from src.datasets.abstract_dataset import AbstractDataModule, AbstractDatasetInfos
-import signal
-from networkx.algorithms.isomorphism import GraphMatcher
+
 from collections import Counter
+from tqdm import tqdm
+from torch.utils.data import Dataset
+
+from torch_geometric.data import Data, InMemoryDataset, Batch
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.nn import GINConv, global_mean_pool
+
+from networkx.algorithms.isomorphism import GraphMatcher
+
+from src.datasets.abstract_dataset import AbstractDataModule, AbstractDatasetInfos
 
 # ==============================================================================
 # 0. 全局配置 & GAR+ 谓词编码逻辑
@@ -288,18 +299,398 @@ def calculate_subgraph_metrics(subG, bigG):
         'label': subG[target_u][target_v]['label']
     }
 
+# ==============================================================================
+# Order-Embedding 模型与算法
+# ==============================================================================
+
+class GraphOrderEncoder(nn.Module):
+    """
+    子图 -> graph embedding
+    GIN + global pooling
+    输出非负 embedding，适合 order relation
+    """
+    def __init__(self, in_dim, hidden_dim=128, emb_dim=64, num_layers=3):
+        super().__init__()
+        self.node_proj = nn.Linear(in_dim, hidden_dim)
+
+        self.convs = nn.ModuleList()
+        for _ in range(num_layers):
+            mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.convs.append(GINConv(mlp))
+
+        self.readout = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, emb_dim),
+        )
+
+        self.out_act = nn.Softplus()
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        x = self.node_proj(x)
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = F.relu(x)
+
+        g = global_mean_pool(x, batch)
+        z = self.readout(g)
+        z = self.out_act(z)
+        return z
+
+
+def order_energy(z_small, z_large):
+    """
+    E(A,B) = || max(0, phi(A)-phi(B)) ||^2
+    """
+    return torch.sum(F.relu(z_small - z_large) ** 2, dim=-1)
+
+
+def order_embedding_loss(z1, z2, y, margin=1.0):
+    """
+    y=1: z1 对应图是 z2 的子图
+    y=0: 不满足子图关系
+    """
+    e = order_energy(z1, z2)
+    pos_loss = y * e
+    neg_loss = (1.0 - y) * F.relu(margin - e)
+    return (pos_loss + neg_loss).mean()
+
+
+def induced_subgraph_by_node_drop(data, keep_ratio=0.7, min_nodes=3):
+    """
+    从一个 PyG Data 中随机删点，生成真正的正样本 A ⊆ B
+    """
+    num_nodes = data.num_nodes
+    keep_num = max(min_nodes, int(num_nodes * keep_ratio))
+
+    if keep_num >= num_nodes or keep_num < min_nodes:
+        return None
+
+    keep_nodes = sorted(random.sample(range(num_nodes), keep_num))
+    keep_set = set(keep_nodes)
+    old_to_new = {old: new for new, old in enumerate(keep_nodes)}
+
+    edge_index = data.edge_index
+    new_edges = []
+    kept_eids = []
+
+    for eid in range(edge_index.size(1)):
+        u = int(edge_index[0, eid])
+        v = int(edge_index[1, eid])
+        if u in keep_set and v in keep_set:
+            new_edges.append([old_to_new[u], old_to_new[v]])
+            kept_eids.append(eid)
+
+    if len(new_edges) == 0:
+        return None
+
+    new_edge_index = torch.tensor(new_edges, dtype=torch.long).t().contiguous()
+    new_x = data.x[keep_nodes]
+    new_n = len(keep_nodes)
+    new_data = Data(
+        x=new_x,
+        edge_index=new_edge_index,
+        # n_nodes=len(keep_nodes),
+        num_nodes = new_n,
+        n_nodes=torch.tensor([new_n], dtype=torch.long),
+        y=torch.zeros(1, 0).float()
+    )
+
+    if hasattr(data, "edge_attr") and data.edge_attr is not None:
+        new_data.edge_attr = data.edge_attr[kept_eids]
+
+    if hasattr(data, "edge_label_mask") and data.edge_label_mask is not None:
+        new_data.edge_label_mask = data.edge_label_mask[kept_eids]
+
+    return new_data
+
+
+class OrderPairDataset(Dataset):
+    """
+    动态构造训练对:
+      正样本: (small_subgraph, original_graph, 1)
+      负样本: (random_graph_i, random_graph_j, 0)
+    """
+    def __init__(self, graph_list, pos_ratio=0.5, min_keep=0.5, max_keep=0.9):
+        self.graph_list = graph_list
+        self.pos_ratio = pos_ratio
+        self.min_keep = min_keep
+        self.max_keep = max_keep
+
+    def __len__(self):
+        return len(self.graph_list)
+
+    def __getitem__(self, idx):
+        if random.random() < self.pos_ratio:
+            large = self.graph_list[idx]
+            small = None
+            for _ in range(10):
+                keep_ratio = random.uniform(self.min_keep, self.max_keep)
+                small = induced_subgraph_by_node_drop(
+                    large, keep_ratio=keep_ratio, min_nodes=3
+                )
+                if small is not None and small.num_nodes < large.num_nodes:
+                    break
+
+            if small is None:
+                j = random.randrange(len(self.graph_list))
+                while j == idx:
+                    j = random.randrange(len(self.graph_list))
+                return self.graph_list[j], self.graph_list[idx], torch.tensor(0.0)
+
+            return small, large, torch.tensor(1.0)
+
+        j = random.randrange(len(self.graph_list))
+        while j == idx:
+            j = random.randrange(len(self.graph_list))
+        return self.graph_list[idx], self.graph_list[j], torch.tensor(0.0)
+
+
+def order_collate_fn(batch):
+    g1_list, g2_list, y_list = zip(*batch)
+    b1 = Batch.from_data_list(list(g1_list))
+    b2 = Batch.from_data_list(list(g2_list))
+    y = torch.stack(list(y_list), dim=0).float()
+    return b1, b2, y
+
+
+def train_order_encoder(
+    graph_list,
+    in_dim,
+    hidden_dim=128,
+    emb_dim=64,
+    num_layers=3,
+    batch_size=32,
+    lr=1e-3,
+    epochs=10,
+    margin=1.0,
+    device=None,
+):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = GraphOrderEncoder(
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
+        emb_dim=emb_dim,
+        num_layers=num_layers,
+    ).to(device)
+
+    dataset = OrderPairDataset(graph_list, pos_ratio=0.5)
+
+    loader = TorchDataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=order_collate_fn,
+    )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_num = 0
+
+        for b1, b2, y in loader:
+            b1 = b1.to(device)
+            b2 = b2.to(device)
+            y = y.to(device)
+
+            z1 = model(b1)
+            z2 = model(b2)
+
+            loss = order_embedding_loss(z1, z2, y, margin=margin)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            bs = y.size(0)
+            total_loss += loss.item() * bs
+            total_num += bs
+
+        print(f"[OrderTrain] Epoch {epoch:03d} | loss={total_loss / max(total_num,1):.6f}")
+
+    return model
+
+
+@torch.no_grad()
+def compute_graph_embeddings(model, graph_list, batch_size=64, device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model.eval()
+    model.to(device)
+
+    loader = PyGDataLoader(
+        graph_list,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: Batch.from_data_list(batch),
+    )
+
+    all_embs = []
+    for batch in loader:
+        batch = batch.to(device)
+        z = model(batch)
+        all_embs.append(z.cpu())
+
+    return torch.cat(all_embs, dim=0)
+
+
+def dominates(e1, e2, eps=1e-9):
+    return np.all(e1 <= e2 + eps)
+
+
+def remove_dominated_embeddings(embs):
+    n = len(embs)
+    keep = []
+    for i in range(n):
+        dominated = False
+        for j in range(n):
+            if i == j:
+                continue
+            if dominates(embs[i], embs[j]):
+                dominated = True
+                break
+        if not dominated:
+            keep.append(i)
+    return keep
+
+
+# def embedding_volume(e):
+#     return float(np.prod(e))
+def embedding_volume(e, eps=1e-8):
+    e = np.asarray(e, dtype=np.float64)
+    return float(np.sum(np.log(e + eps)))
+
+def compute_thresholds(embs, sigma, chi=1.0):
+    """
+    Threshold[i] = 第 i 维 top-(chi*sigma) 大值中的最小值
+    论文要求 chi in [0,1]
+    """
+    embs = np.asarray(embs, dtype=np.float32)
+    n, d = embs.shape
+
+    if not (0 < chi <= 1.0):
+        raise ValueError(f"chi should be in (0,1], got {chi}")
+
+    m = max(1, min(n, int(math.ceil(chi * sigma))))
+
+    thresholds = np.zeros(d, dtype=np.float32)
+    for i in range(d):
+        vals = np.sort(embs[:, i])[::-1]
+        thresholds[i] = vals[m - 1]
+
+    return thresholds
+
+
+def pick_patterns(embs, k, sigma, chi=1.0):
+    """
+    更贴论文的 PickPatterns:
+      1) remove dominated
+      2) sort by volume descending
+      3) compute thresholds using chi*sigma
+      4) Cover initialized to 0
+    """
+    embs = np.asarray(embs, dtype=np.float32)
+
+    remain_idx = remove_dominated_embeddings(embs)
+    remain_embs = embs[remain_idx]
+
+    if len(remain_embs) == 0:
+        return []
+
+    volumes = np.array([embedding_volume(e) for e in remain_embs], dtype=np.float32)
+    order = np.argsort(-volumes)
+
+    remain_embs = remain_embs[order]
+    remain_idx = [remain_idx[i] for i in order]
+
+    thresholds = compute_thresholds(remain_embs, sigma=sigma, chi=chi)
+
+    d = remain_embs.shape[1]
+    cover = np.zeros(d, dtype=np.float32)   # 按论文初始化为 0
+    selected = []
+
+    for idx, e in zip(remain_idx, remain_embs):
+        should_add = False
+        for j in range(d):
+            if e[j] > cover[j] and e[j] <= thresholds[j]:
+                should_add = True
+                break
+
+        if should_add:
+            selected.append(idx)
+            cover = np.maximum(cover, e)
+
+        if len(selected) >= k:
+            break
+
+    return selected
+
+
+@torch.no_grad()
+def sanity_check_order(model, graph_list, num_trials=10, device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model.eval().to(device)
+    ok = 0
+    total = 0
+
+    for _ in range(num_trials):
+        g_large = random.choice(graph_list)
+        g_small = induced_subgraph_by_node_drop(g_large, keep_ratio=0.7, min_nodes=3)
+        if g_small is None:
+            continue
+
+        b_small = Batch.from_data_list([g_small]).to(device)
+        b_large = Batch.from_data_list([g_large]).to(device)
+
+        z_small = model(b_small)
+        z_large = model(b_large)
+
+        e1 = order_energy(z_small, z_large).item()
+        e2 = order_energy(z_large, z_small).item()
+
+        print(f"[Sanity] E(small,large)={e1:.4f}, E(large,small)={e2:.4f}")
+        total += 1
+        if e1 < e2:
+            ok += 1
+
+    print(f"[Sanity] pass rate: {ok}/{max(total,1)}")
 
 # ==============================================================================
 # 2. Dataset 类定义
 # ==============================================================================
 
 class PPIGraphDataset(InMemoryDataset):
-    def __init__(self, root, split='train', transform=None, pre_transform=None, pre_filter=None, 
-                 num_subgraphs=2000, min_nodes=3, max_nodes=5):
+    def __init__(
+        self,
+        root,
+        split='train',
+        stage='final',   # 'raw' or 'final'
+        transform=None,
+        pre_transform=None,
+        pre_filter=None,
+        num_subgraphs=2000,
+        min_nodes=3,
+        max_nodes=5
+    ):
         self.num_subgraphs = num_subgraphs
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
         self.split = split
+        self.stage = stage
+
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
 
@@ -307,8 +698,14 @@ class PPIGraphDataset(InMemoryDataset):
     def raw_file_names(self):
         return ['protein_protein_with_type.csv', 'protein.csv']
 
+    # @property
+    # def processed_file_names(self):
+    #     return [f'ppi_{self.split}.pt']
+    # 区分两个阶段的训练数据
     @property
     def processed_file_names(self):
+        if self.stage == 'raw':
+            return [f'ppi_{self.split}_raw.pt']
         return [f'ppi_{self.split}.pt']
 
     def download(self):
@@ -496,11 +893,16 @@ class PPIGraphDataset(InMemoryDataset):
         
         print(f"*Overall neg sub pattern: {neg_sub_cnt}")
         print(f"*Overall high support pattern: {high_support_cnt}")
-    
+
         pbar.close()
+
+        if len(data_list) == 0:
+            print("[FATAL] No sampled subgraphs collected.")
+            return
+
         data, slices = self.collate(data_list)
         torch.save((data, slices), self.processed_paths[0])
-        print("Done!")
+        print(f"[Done] Saved sampled subgraphs: {len(data_list)} -> {self.processed_paths[0]}")
 
     def _to_pyg_data(self, G):
         # 1) 节点特征：feature_val (0..3) -> 4维 one-hot
@@ -576,7 +978,8 @@ class PPIGraphDataset(InMemoryDataset):
             edge_index=edge_index,
             edge_attr=edge_attr,
             edge_label_mask=edge_label_mask,
-            n_nodes=n,
+            n_nodes=torch.tensor([n], dtype=torch.long),
+            num_nodes=n,
             y=y
         )
 
@@ -595,15 +998,23 @@ class PPIDataModule(AbstractDataModule):
         abs_datadir = os.path.join(project_root, 'data', 'PPI')
         self.datadir = abs_datadir
         print(f"[Info] Absolute Data Directory: {self.datadir}")
-        
+
+        final_path = os.path.join(self.datadir, "processed", "ppi_train.pt")
+        if not os.path.exists(final_path):
+            raise FileNotFoundError(
+                f"Final PPI training set not found: {final_path}\n"
+                f"Please run: python src/preprocess/train_ppi_order_and_pick.py"
+            )
+
         base_dataset = PPIGraphDataset(
-            root=self.datadir, 
+            root=self.datadir,
+            split='train',
+            stage='final',
             num_subgraphs=cfg.dataset.num_subgraphs,
             min_nodes=cfg.dataset.min_nodes,
             max_nodes=cfg.dataset.max_nodes,
-            split='train' 
         )
-        
+
         datasets = {'train': base_dataset, 'val': base_dataset, 'test': base_dataset}
         super().__init__(cfg, datasets)
 
