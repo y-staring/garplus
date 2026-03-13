@@ -23,7 +23,7 @@ RAW_MAX_NODES = 8
 
 PICK_K = 1000
 PICK_SIGMA = 10
-PICK_CHI = 0.5
+PICK_CHI = 0.1
 
 HIDDEN_DIM = 128
 EMB_DIM = 64
@@ -143,11 +143,20 @@ def main():
     # ==========================================================
     # 5) PickPatterns
     # ==========================================================
+    # selected_idx = pick_patterns(
+    #     embs=embs_np,
+    #     k=PICK_K,
+    #     sigma=PICK_SIGMA,
+    #     chi=PICK_CHI,
+    # )
+
     selected_idx = pick_patterns(
         embs=embs_np,
         k=PICK_K,
         sigma=PICK_SIGMA,
         chi=PICK_CHI,
+        remove_dominated= False,
+        # dominated_keep_ratio=0.3
     )
 
     if len(selected_idx) == 0:

@@ -592,47 +592,174 @@ def compute_thresholds(embs, sigma, chi=1.0):
     return thresholds
 
 
-def pick_patterns(embs, k, sigma, chi=1.0):
+def pick_patterns(
+    embs,
+    k,
+    sigma,
+    chi=1.0,
+    remove_dominated=True,
+    dominated_keep_ratio=0.0,
+    verbose=True,
+    debug_topk=10,
+):
     """
-    更贴论文的 PickPatterns:
-      1) remove dominated
-      2) sort by volume descending
-      3) compute thresholds using chi*sigma
-      4) Cover initialized to 0
+    PickPatterns with optional relaxed dominated filtering + debug prints.
     """
     embs = np.asarray(embs, dtype=np.float32)
+    n = len(embs)
 
-    remain_idx = remove_dominated_embeddings(embs)
+    if n == 0:
+        return []
+
+    print("=" * 80)
+    print(f"[PickPatterns] total embeddings = {n}")
+    print(f"[PickPatterns] remove_dominated = {remove_dominated}")
+    print(f"[PickPatterns] dominated_keep_ratio = {dominated_keep_ratio}")
+    print(f"[PickPatterns] k = {k}, sigma = {sigma}, chi = {chi}")
+
+    # -----------------------------
+    # Step 1: dominated filtering
+    # -----------------------------
+    if remove_dominated:
+        nd_idx = remove_dominated_embeddings(embs)
+        print(f"[Step1] non-dominated count = {len(nd_idx)}")
+
+        if dominated_keep_ratio <= 0.0:
+            remain_idx = nd_idx
+            print(f"[Step1] strict paper mode, remain = {len(remain_idx)}")
+        else:
+            nd_set = set(nd_idx)
+            dom_idx = [i for i in range(n) if i not in nd_set]
+            extra_num = int(len(dom_idx) * dominated_keep_ratio)
+
+            print(f"[Step1] dominated count = {len(dom_idx)}")
+            print(f"[Step1] extra dominated kept = {extra_num}")
+
+            if extra_num > 0:
+                dom_vols = np.array([embedding_volume(embs[i]) for i in dom_idx], dtype=np.float32)
+                order_dom = np.argsort(-dom_vols)
+                extra_idx = [dom_idx[i] for i in order_dom[:extra_num]]
+            else:
+                extra_idx = []
+
+            remain_idx = nd_idx + extra_idx
+            print(f"[Step1] remain after relaxed filtering = {len(remain_idx)}")
+    else:
+        remain_idx = list(range(n))
+        print(f"[Step1] skipped dominated filtering, remain = {len(remain_idx)}")
+
     remain_embs = embs[remain_idx]
 
     if len(remain_embs) == 0:
+        print("[PickPatterns] remain_embs is empty")
         return []
 
+    # -----------------------------
+    # Step 2: sort by volume desc
+    # -----------------------------
     volumes = np.array([embedding_volume(e) for e in remain_embs], dtype=np.float32)
     order = np.argsort(-volumes)
 
     remain_embs = remain_embs[order]
     remain_idx = [remain_idx[i] for i in order]
+    volumes = volumes[order]
 
+    print(f"[Step2] remain_embs sorted by volume, count = {len(remain_embs)}")
+    print(f"[Step2] volume stats: min={volumes.min():.4f}, max={volumes.max():.4f}, "
+          f"mean={volumes.mean():.4f}, median={np.median(volumes):.4f}")
+    print(f"[Step2] top-{min(debug_topk, len(volumes))} volumes = {volumes[:debug_topk]}")
+
+    # -----------------------------
+    # Step 3: thresholds
+    # -----------------------------
     thresholds = compute_thresholds(remain_embs, sigma=sigma, chi=chi)
 
+    print(f"[Step3] threshold shape = {thresholds.shape}")
+    print(f"[Step3] threshold stats: min={thresholds.min():.6f}, "
+          f"max={thresholds.max():.6f}, mean={thresholds.mean():.6f}, "
+          f"median={np.median(thresholds):.6f}")
+    print(f"[Step3] first-{min(debug_topk, len(thresholds))} thresholds = {thresholds[:debug_topk]}")
+
+    # 看 embedding 相对 threshold 的关系
+    num_all_above = 0
+    num_all_below = 0
+    num_partial = 0
+
+    for e in remain_embs:
+        le_mask = (e <= thresholds)
+        if np.all(le_mask):
+            num_all_below += 1
+        elif np.any(le_mask):
+            num_partial += 1
+        else:
+            num_all_above += 1
+
+    print(f"[Step3] embeddings all <= threshold: {num_all_below}")
+    print(f"[Step3] embeddings partially <= threshold: {num_partial}")
+    print(f"[Step3] embeddings all > threshold: {num_all_above}")
+
+    # -----------------------------
+    # Step 4: greedy cover
+    # -----------------------------
     d = remain_embs.shape[1]
-    cover = np.zeros(d, dtype=np.float32)   # 按论文初始化为 0
+    cover = np.zeros(d, dtype=np.float32)
     selected = []
 
-    for idx, e in zip(remain_idx, remain_embs):
-        should_add = False
-        for j in range(d):
-            if e[j] > cover[j] and e[j] <= thresholds[j]:
-                should_add = True
-                break
+    reject_cover_only = 0
+    reject_threshold_only = 0
+    reject_both = 0
+    accept_count = 0
+
+    print(f"[Step4] before select: {len(remain_idx)} candidates")
+
+    for t, (idx, e) in enumerate(zip(remain_idx, remain_embs)):
+        gt_cover = (e > cover)
+        le_thresh = (e <= thresholds)
+
+        cond = gt_cover & le_thresh
+        should_add = np.any(cond)
 
         if should_add:
             selected.append(idx)
-            cover = np.maximum(cover, e)
+            # cover = np.maximum(cover, e)
+            cover = np.maximum(cover, cover + 0.3 * (e - cover))
+            accept_count += 1
+
+            if verbose and (accept_count <= debug_topk):
+                print(f"[ACCEPT {accept_count}] idx={idx}, step={t}, "
+                      f"num_dims_gt_cover={gt_cover.sum()}, "
+                      f"num_dims_le_thresh={le_thresh.sum()}, "
+                      f"num_dims_valid={(cond).sum()}, "
+                      f"cover_mean={cover.mean():.6f}, cover_max={cover.max():.6f}")
+        else:
+            has_gt_cover = np.any(gt_cover)
+            has_le_thresh = np.any(le_thresh)
+
+            if has_gt_cover and not has_le_thresh:
+                reject_threshold_only += 1
+            elif (not has_gt_cover) and has_le_thresh:
+                reject_cover_only += 1
+            else:
+                reject_both += 1
+
+            if verbose and (t < debug_topk):
+                print(f"[REJECT] idx={idx}, step={t}, "
+                      f"num_dims_gt_cover={gt_cover.sum()}, "
+                      f"num_dims_le_thresh={le_thresh.sum()}, "
+                      f"num_dims_valid={(cond).sum()}")
 
         if len(selected) >= k:
+            print(f"[Step4] reached k={k}, terminate early")
             break
+
+    print(f"[Step4] after select: {len(selected)}")
+    print(f"[Step4] accepted = {accept_count}")
+    print(f"[Step4] rejected by threshold-only = {reject_threshold_only}")
+    print(f"[Step4] rejected by cover-only = {reject_cover_only}")
+    print(f"[Step4] rejected by both/other = {reject_both}")
+    print(f"[Step4] final cover stats: min={cover.min():.6f}, max={cover.max():.6f}, "
+          f"mean={cover.mean():.6f}, median={np.median(cover):.6f}")
+    print("=" * 80)
 
     return selected
 
