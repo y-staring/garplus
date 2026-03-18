@@ -557,6 +557,7 @@ def remove_dominated_embeddings(embs):
         for j in range(n):
             if i == j:
                 continue
+            # per coordinate less than
             if dominates(embs[i], embs[j]):
                 dominated = True
                 break
@@ -571,25 +572,183 @@ def embedding_volume(e, eps=1e-8):
     e = np.asarray(e, dtype=np.float64)
     return float(np.sum(np.log(e + eps)))
 
+# def compute_thresholds(embs, sigma, chi=1.0):
+#     """
+#     Threshold[i] = 第 i 维 top-(chi*sigma) 大值中的最小值
+#     论文要求 chi in [0,1]
+#     """
+#     embs = np.asarray(embs, dtype=np.float32)
+#     n, d = embs.shape
+
+#     if not (0 < chi <= 1.0):
+#         raise ValueError(f"chi should be in (0,1], got {chi}")
+
+#     m = max(1, min(n, int(math.ceil(chi * sigma))))
+
+#     thresholds = np.zeros(d, dtype=np.float32)
+#     for i in range(d):
+#         vals = np.sort(embs[:, i])[::-1]
+#         thresholds[i] = vals[m - 1]
+
+#     return thresholds
+
+
+import heapq
 def compute_thresholds(embs, sigma, chi=1.0):
     """
+    按论文思路计算 Threshold[i]:
     Threshold[i] = 第 i 维 top-(chi*sigma) 大值中的最小值
-    论文要求 chi in [0,1]
+
+    参数
+    ----
+    embs : array-like, shape (n, d)
+        所有 embedding
+    sigma : int
+        论文中的 sigma
+    chi : float, default=1.0
+        论文中的 chi, 通常 in [0, 1]
+
+    返回
+    ----
+    thresholds : np.ndarray, shape (d,)
     """
     embs = np.asarray(embs, dtype=np.float32)
     n, d = embs.shape
 
+    if sigma <= 0:
+        raise ValueError(f"sigma should be positive, got {sigma}")
     if not (0 < chi <= 1.0):
         raise ValueError(f"chi should be in (0,1], got {chi}")
 
+    # 这里沿用你之前的实现约定：ceil(chi * sigma)
     m = max(1, min(n, int(math.ceil(chi * sigma))))
 
     thresholds = np.zeros(d, dtype=np.float32)
+
+    # 对每一维维护一个大小最多为 m 的最小堆
+    # 堆里始终保存“当前 top-m 大值”
     for i in range(d):
-        vals = np.sort(embs[:, i])[::-1]
-        thresholds[i] = vals[m - 1]
+        heap = []
+
+        for e in embs:
+            ai = float(e[i])
+
+            # (i) 若 |S_th^i| < m，则直接加入
+            if len(heap) < m:
+                heapq.heappush(heap, ai)
+            # 否则若 ai > Threshold[i]（也就是当前堆顶最小值），替换之
+            elif ai > heap[0]:
+                heapq.heapreplace(heap, ai)
+
+        # (ii) Threshold[i] 定义为 S_th^i 中最小值
+        thresholds[i] = heap[0]
 
     return thresholds
+
+def select_graphs(
+    embs,
+    method="topk",
+    k=1000,
+    seed=42,
+    sigma=10,
+    chi=0.7,
+):
+    """
+    Unified graph selector.
+
+    Args:
+        embs: [N, d] embedding matrix
+        method: "pickpatterns" | "topk" | "fps" | "random"
+        k: number of graphs to select
+        seed: random seed
+        sigma, chi: only used by pickpatterns
+    """
+
+    if method == "pickpatterns":
+        print("[Selector] Using PickPatterns")
+        return pick_patterns(
+            embs=embs,
+            k=k,
+            sigma=sigma,
+            chi=chi,
+        )
+
+    elif method == "topk":
+        print("[Selector] Using Top-K volume")
+        return select_topk_embeddings(embs, k)
+
+    elif method == "fps":
+        print("[Selector] Using Farthest Point Sampling")
+        return select_by_fps(embs, k, seed)
+
+    elif method == "random":
+        print("[Selector] Using Random sampling")
+        return select_random(embs, k, seed)
+
+    else:
+        raise ValueError(f"Unknown selector: {method}")
+    
+def select_topk_embeddings(embs, k):
+    embs = np.asarray(embs, dtype=np.float32)
+    n = len(embs)
+
+    volumes = np.array([embedding_volume(e) for e in embs], dtype=np.float32)
+    order = np.argsort(-volumes)
+
+    k = min(k, n)
+
+    print("Top volume:", volumes[order[:5]])
+    print("Total graphs:", n)
+    print("Selected:", k)
+
+    return order[:k].tolist()
+
+def select_by_fps(embs, k, seed=42):
+
+    embs = np.asarray(embs, dtype=np.float32)
+    n = len(embs)
+
+    if k >= n:
+        return list(range(n))
+
+    rng = np.random.default_rng(seed)
+
+    selected = []
+    first = int(rng.integers(0, n))
+    selected.append(first)
+
+    dist = np.full(n, np.inf)
+
+    for _ in range(1, k):
+
+        last = selected[-1]
+
+        d = np.sum((embs - embs[last]) ** 2, axis=1)
+        dist = np.minimum(dist, d)
+
+        dist[selected] = -1
+
+        nxt = int(np.argmax(dist))
+
+        if dist[nxt] < 0:
+            break
+
+        selected.append(nxt)
+
+    return selected
+
+import random
+
+import random
+
+def select_random(embs, k, seed=42):
+    n = len(embs)
+    print("len(embs):", n)
+    if k >= n:
+        return list(range(n))
+
+    random.seed(seed)
+    return random.sample(range(n), k)
 
 
 def pick_patterns(
@@ -622,7 +781,7 @@ def pick_patterns(
     # -----------------------------
     if remove_dominated:
         nd_idx = remove_dominated_embeddings(embs)
-        print(f"[Step1] non-dominated count = {len(nd_idx)}")
+        print(f"[Step1] left embedding count = {len(nd_idx)}")
 
         if dominated_keep_ratio <= 0.0:
             remain_idx = nd_idx

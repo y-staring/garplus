@@ -22,7 +22,7 @@ RAW_MIN_NODES = 4
 RAW_MAX_NODES = 8
 
 PICK_K = 1000
-PICK_SIGMA = 10
+PICK_SIGMA = 500
 PICK_CHI = 0.1
 
 HIDDEN_DIM = 128
@@ -32,6 +32,10 @@ BATCH_SIZE = 32
 LR = 1e-3
 EPOCHS = 15
 MARGIN = 1.0
+
+SELECTOR = "pickpatterns"
+TARGET_NUM = 2000
+
 
 ENCODER_FILENAME = "ppi_order_encoder.pt"
 EMB_FILENAME = "ppi_train_embeddings.pt"
@@ -48,6 +52,7 @@ from src.datasets.ppi_dataset_order_embedding import (
     train_order_encoder,
     compute_graph_embeddings,
     pick_patterns,
+    select_graphs,
     sanity_check_order,
     GraphOrderEncoder,   # 需要能直接构造模型
 )
@@ -159,6 +164,14 @@ def main():
         # dominated_keep_ratio=0.3
     )
 
+    # selected_idx = select_graphs(
+    #     embs=embs_np,
+    #     method=SELECTOR,
+    #     k=TARGET_NUM,
+    #     seed=42,
+    #     sigma=PICK_SIGMA,
+    #     chi=0.7,
+    # )   
     if len(selected_idx) == 0:
         print("[WARN] PickPatterns selected 0 graphs, fallback to all raw graphs.")
         selected_graphs = data_list
