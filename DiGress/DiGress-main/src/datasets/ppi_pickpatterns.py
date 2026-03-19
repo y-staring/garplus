@@ -33,7 +33,7 @@ LR = 1e-3
 EPOCHS = 15
 MARGIN = 1.0
 
-SELECTOR = "pickpatterns"
+SELECTOR = "fps"
 TARGET_NUM = 2000
 
 
@@ -155,23 +155,23 @@ def main():
     #     chi=PICK_CHI,
     # )
 
-    selected_idx = pick_patterns(
-        embs=embs_np,
-        k=PICK_K,
-        sigma=PICK_SIGMA,
-        chi=PICK_CHI,
-        remove_dominated= False,
-        # dominated_keep_ratio=0.3
-    )
-
-    # selected_idx = select_graphs(
+    # selected_idx = pick_patterns(
     #     embs=embs_np,
-    #     method=SELECTOR,
-    #     k=TARGET_NUM,
-    #     seed=42,
+    #     k=PICK_K,
     #     sigma=PICK_SIGMA,
-    #     chi=0.7,
-    # )   
+    #     chi=PICK_CHI,
+    #     remove_dominated= False,
+    #     # dominated_keep_ratio=0.3
+    # )
+
+    selected_idx = select_graphs(
+        embs=embs_np,
+        method=SELECTOR,
+        k=TARGET_NUM,
+        seed=42,
+        sigma=PICK_SIGMA,
+        chi=0.7,
+    )   
     if len(selected_idx) == 0:
         print("[WARN] PickPatterns selected 0 graphs, fallback to all raw graphs.")
         selected_graphs = data_list
