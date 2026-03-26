@@ -13,13 +13,13 @@ torch.cuda.manual_seed_all(seed)
 # =========================
 # 开关配置
 # =========================
-RETRAIN_ENCODER = False
-RECOMPUTE_EMBEDDINGS = False
+RETRAIN_ENCODER = True
+RECOMPUTE_EMBEDDINGS = True
 RUN_SANITY_CHECK = True
 
 RAW_NUM_SUBGRAPHS = 4000
-RAW_MIN_NODES = 4
-RAW_MAX_NODES = 8
+RAW_MIN_NODES = 5
+RAW_MAX_NODES = 10
 
 PICK_K = 1000
 PICK_SIGMA = 500
@@ -39,7 +39,11 @@ TARGET_NUM = 2000
 
 ENCODER_FILENAME = "ppi_order_encoder.pt"
 EMB_FILENAME = "ppi_train_embeddings.pt"
-FINAL_FILENAME = "ppi_train.pt"
+
+RAW_FILENAME = "ppi_train_raw.pt"
+TRAIN_FILENAME = "ppi_train.pt"
+VAL_FILENAME = "ppi_val.pt"
+TEST_FILENAME = "ppi_test.pt"
 
 # 保证能从项目根目录导入
 CURRENT_FILE = os.path.realpath(__file__)
@@ -61,6 +65,32 @@ from src.datasets.ppi_dataset_order_embedding import (
 def load_data_list_from_inmemory(dataset):
     return [dataset.get(i) for i in range(len(dataset))]
 
+def split_graphs(graph_list, seed=42):
+    num_graphs = len(graph_list)
+
+    test_len = int(round(num_graphs * 0.2))
+    train_len = int(round((num_graphs - test_len) * 0.8))
+    val_len = num_graphs - train_len - test_len
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(num_graphs)
+    rng.shuffle(indices)
+
+    train_idx = indices[:train_len]
+    val_idx = indices[train_len:train_len + val_len]
+    test_idx = indices[train_len + val_len:]
+
+    train_graphs = [graph_list[i] for i in train_idx]
+    val_graphs = [graph_list[i] for i in val_idx]
+    test_graphs = [graph_list[i] for i in test_idx]
+
+    print(f"[Split] Total: {num_graphs}")
+    print(f"[Split] Train: {len(train_graphs)}")
+    print(f"[Split] Val:   {len(val_graphs)}")
+    print(f"[Split] Test:  {len(test_graphs)}")
+
+    return train_graphs, val_graphs, test_graphs
+
 
 def main():
     datadir = os.path.join(PROJECT_ROOT, "data", "PPI")
@@ -69,7 +99,11 @@ def main():
 
     encoder_path = os.path.join(processed_dir, ENCODER_FILENAME)
     emb_path = os.path.join(processed_dir, EMB_FILENAME)
-    final_path = os.path.join(processed_dir, FINAL_FILENAME)
+
+    raw_path = os.path.join(processed_dir, RAW_FILENAME)
+    train_path = os.path.join(processed_dir, TRAIN_FILENAME)
+    val_path = os.path.join(processed_dir, VAL_FILENAME)
+    test_path = os.path.join(processed_dir, TEST_FILENAME)
 
     # ==========================================================
     # 1) 读取 raw sampled subgraphs
@@ -85,6 +119,7 @@ def main():
 
     data_list = load_data_list_from_inmemory(raw_dataset)
     print(f"[Info] Loaded raw sampled subgraphs: {len(data_list)}")
+    print(f"[Info] Raw pool file: {raw_path}")
 
     if len(data_list) == 0:
         raise RuntimeError("No sampled graphs found in raw dataset.")
@@ -168,21 +203,19 @@ def main():
         embs=embs_np,
         method=SELECTOR,
         k=TARGET_NUM,
-        seed=42,
+        seed=seed,
         sigma=PICK_SIGMA,
         chi=0.7,
-    )   
+    )
+
     if len(selected_idx) == 0:
-        print("[WARN] PickPatterns selected 0 graphs, fallback to all raw graphs.")
+        print("[WARN] selector selected 0 graphs, fallback to all raw graphs.")
         selected_graphs = data_list
     else:
         selected_graphs = [data_list[i] for i in selected_idx]
 
-    print(f"[Info] PickPatterns selected {len(selected_graphs)} / {len(data_list)} graphs")
+    print(f"[Info] Selected {len(selected_graphs)} / {len(data_list)} graphs")
 
-    # ==========================================================
-    # 6) 保存 embeddings
-    # ==========================================================
     torch.save(
         {
             "embeddings": embs,
@@ -191,17 +224,25 @@ def main():
             "pick_sigma": PICK_SIGMA,
             "pick_chi": PICK_CHI,
             "raw_num_graphs": len(data_list),
+            "selected_num_graphs": len(selected_graphs),
         },
         emb_path,
     )
     print(f"[Info] Saved embeddings to: {emb_path}")
 
-    # ==========================================================
-    # 7) 保存最终 diffusion 训练集
-    # ==========================================================
-    data, slices = raw_dataset.collate(selected_graphs)
-    torch.save((data, slices), final_path)
-    print(f"[Done] Saved final diffusion dataset to: {final_path}")
+    train_graphs, val_graphs, test_graphs = split_graphs(selected_graphs, seed=seed)
+
+    train_data, train_slices = raw_dataset.collate(train_graphs)
+    val_data, val_slices = raw_dataset.collate(val_graphs)
+    test_data, test_slices = raw_dataset.collate(test_graphs)
+
+    torch.save((train_data, train_slices), train_path)
+    torch.save((val_data, val_slices), val_path)
+    torch.save((test_data, test_slices), test_path)
+
+    print(f"[Done] Saved train dataset -> {train_path}")
+    print(f"[Done] Saved val dataset   -> {val_path}")
+    print(f"[Done] Saved test dataset  -> {test_path}")
 
 
 if __name__ == "__main__":

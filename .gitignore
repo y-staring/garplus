@@ -6,6 +6,7 @@ checkpoints/
 *.pt
 *.ckpt
 *.npy
+*.zip
 *.npz
 logs/
 wandb/
@@ -16,3 +17,4 @@ GNN/code/biogrid_positive_edges_expanded.csv
 GNN/code/DDA_test/data/
 GNN/code/DDA_test/data_signed/
 GNN/code/TI_test/data_signed/
+GNN/code/DDA_test.zip

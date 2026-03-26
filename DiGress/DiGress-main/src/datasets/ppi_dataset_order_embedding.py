@@ -81,23 +81,103 @@ EDGE_BIT_MAP = {
 # --- [MODIFIED] 特征维度定义 ---
 #======给每个节点赋予一个类别的值============
 NUM_NODE_CLASSES = 10
-NUM_EDGE_CLASSES = 1 + (2 ** len(EDGE_BIT_MAP))  # 1 + 2^7 = 129
+# NUM_EDGE_CLASSES = 1 + (2 ** len(EDGE_BIT_MAP))  # 1 + 2^7 = 129
+NUM_EDGE_CLASSES = 0
+
+EDGE_LABEL_MAPPING = None
 
 
-# # --- [NEW] 编码函数实现 ---
-# def encode_node_feature(node_attr: dict) -> int:
-#     """ 将单个节点的属性字典编码为一个整数特征 N (0-3) """
-#     n_feature = 0
-#     # 判定 1: x.is_kinase
-#     keywords = str(node_attr.get('Keywords', ''))
-#     families = str(node_attr.get('Protein families', ''))
-#     if 'Kinase' in keywords or 'ATP-binding' in keywords or 'Kinase' in families:
-#         n_feature |= (1 << NODE_BIT_MAP['is_kinase'])
-#     # 判定 2: x.is_disease_related
-#     if pd.notna(node_attr.get('Involvement in disease')):
-#         n_feature |= (1 << NODE_BIT_MAP['is_disease_related'])
-#     return n_feature
 
+def _norm_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+#compress bitmask
+def is_negative_raw_bitmask(raw_bitmask: int) -> bool:
+    raw_bitmask = int(raw_bitmask)
+    return bool(raw_bitmask & (1 << EDGE_BIT_MAP["is_negative"]))
+
+
+def collect_used_edge_bitmasks(graphs) -> list:
+    """
+    从一组 NetworkX 图中收集实际出现过的 raw bitmask（非零）。
+    """
+    used = set()
+    for G in graphs:
+        for _, _, d in G.edges(data=True):
+            raw_val = int(d.get("raw_label", d.get("label", 0)))
+            if raw_val != 0:
+                used.add(raw_val)
+    return sorted(used)
+
+
+def build_edge_label_mapping(graphs):
+    """
+    构建压缩映射：
+      raw bitmask -> compressed class id
+
+    约定：
+      0 = no-edge
+      1..K = 实际出现过的 raw bitmask
+    """
+    used_masks = collect_used_edge_bitmasks(graphs)
+    bitmask_to_class = {mask: i + 1 for i, mask in enumerate(used_masks)}
+    class_to_bitmask = {i + 1: mask for i, mask in enumerate(used_masks)}
+
+    return {
+        "bitmask_to_class": bitmask_to_class,
+        "class_to_bitmask": class_to_bitmask,
+        "num_edge_classes": len(used_masks) + 1,
+        "used_masks": used_masks,
+    }
+
+
+def compress_edge_label(raw_bitmask: int, bitmask_to_class: dict) -> int:
+    """
+    raw bitmask -> compressed class id
+    """
+    raw_bitmask = int(raw_bitmask)
+    if raw_bitmask == 0:
+        return 0
+    if raw_bitmask not in bitmask_to_class:
+        raise ValueError(f"Unknown raw edge bitmask: {raw_bitmask}")
+    return int(bitmask_to_class[raw_bitmask])
+
+
+def decompress_edge_label(edge_class: int, class_to_bitmask: dict) -> int:
+    """
+    compressed class id -> raw bitmask
+    """
+    edge_class = int(edge_class)
+    if edge_class == 0:
+        return 0
+    if edge_class not in class_to_bitmask:
+        raise ValueError(f"Unknown compressed edge class: {edge_class}")
+    return int(class_to_bitmask[edge_class])
+
+
+def print_edge_label_stats(graphs, mapping):
+    raw_counter = Counter()
+    comp_counter = Counter()
+
+    for G in graphs:
+        for _, _, d in G.edges(data=True):
+            raw_counter[int(d.get("raw_label", 0))] += 1
+            comp_counter[int(d.get("label", 0))] += 1
+
+    print("==== Bitmask stats ====")
+    print(f"不同 bitmask（谓词组合）数量 = {len([k for k in raw_counter if k != 0])}")
+    print(f"总边数 = {sum(raw_counter.values())}")
+    print(f"最常见的 10 种 bitmask = {raw_counter.most_common(10)}")
+
+    print("==== Compressed edge label stats ====")
+    print(f"used bitmasks = {mapping['used_masks']}")
+    print(f"num compressed edge classes = {mapping['num_edge_classes']}")
+    print(f"最常见的 10 种 compressed labels = {comp_counter.most_common(10)}")
 
 
 
@@ -129,17 +209,6 @@ def encode_node_feature(node_attr: dict) -> int:
         node_attr.get("Subcellular location [CC]", node_attr.get("location", ""))
     )
     return map_loc_to_category(loc_raw)
-
-
-
-
-def _norm_str(v) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, float) and pd.isna(v):
-        return ""
-    return str(v).strip()
-
 
 def encode_edge_feature(
     id_x,
@@ -193,7 +262,8 @@ def encode_edge_feature(
         e_feature |= (1 << EDGE_BIT_MAP["x_low_betweenness"])
 
     # D/E) edge_row 相关邮票：M_sim / Affinity Capture-MS / physical / negative
-    if edge_row:
+    # if edge_row:
+    if edge_row is not None:
         # D) M_sim：看 ml_score 是否过阈值
         try:
             ml_score = float(edge_row.get("ml_score", 0.0))
@@ -225,65 +295,66 @@ def encode_edge_feature(
 # ==============================================================================
 # 1. 验证函数 (Validation)
 # ==============================================================================
-
 def edge_match(d1, d2):
+    # GraphMatcher 用压缩后的训练标签做匹配
     return d1.get('label') == d2.get('label')
 
+
 def node_match_fn(n1, n2):
-    # [MODIFIED] 使用细粒度的位掩码特征进行匹配
     return n1.get('feature_val') == n2.get('feature_val')
+
 
 def calculate_subgraph_metrics(subG, bigG):
     """
     计算子图在生成它的母图(BigG)中的 Support 和 Confidence。
+    负边判断必须基于 raw_label，而不是压缩后的 label。
     """
     edges_to_test = list(subG.edges(data=True))
-    
+
     candidates = []
     for u, v, d in edges_to_test:
-        val = d.get('label', 0)
-        # [MODIFIED] 检查 Bit 7 是否为 1
-        is_negative_edge = bool(val & (1 << EDGE_BIT_MAP['is_negative']))
-        if is_negative_edge:
-            candidates.append((u,v))
+        raw_val = d.get('raw_label', 0)
+        if is_negative_raw_bitmask(raw_val):
+            candidates.append((u, v))
 
-    if not candidates: return None
+    if not candidates:
+        return None
 
     target_u, target_v = candidates[0]
-    
-    # 1. 构建前提 (挖掉这条负边)
+
     premiseG = subG.copy()
     premiseG.remove_edge(target_u, target_v)
-    
-    if premiseG.number_of_edges() == 0: return None
 
-    # 2. 匹配
+    if premiseG.number_of_edges() == 0:
+        return None
+
     GM = GraphMatcher(bigG, premiseG, node_match=node_match_fn, edge_match=edge_match)
-    
+
     unique_matches = set()
     supp_neg = 0
-    
+
     try:
         with TimeLimit(TIME_LIMIT):
             for mapping in GM.subgraph_isomorphisms_iter():
                 real_u = mapping.get(target_u)
                 real_v = mapping.get(target_v)
-                
-                if real_u is None or real_v is None: continue
-                
+
+                if real_u is None or real_v is None:
+                    continue
+
                 edge_key = frozenset([real_u, real_v])
-                if edge_key in unique_matches: continue
+                if edge_key in unique_matches:
+                    continue
                 unique_matches.add(edge_key)
-                
+
                 if bigG.has_edge(real_u, real_v):
-                    real_label = bigG[real_u][real_v].get('label', 0)
-                    # [MODIFIED] 检查大图中的边是否也是负边
-                    real_is_neg = bool(real_label & (1 << EDGE_BIT_MAP['is_negative']))
-                    if real_is_neg:
+                    real_raw_label = bigG[real_u][real_v].get('raw_label', 0)
+                    if is_negative_raw_bitmask(real_raw_label):
                         supp_neg += 1
-                
-                if len(unique_matches) >= MATCH_LIMIT: break
-                    
+
+                if len(unique_matches) >= MATCH_LIMIT:
+                    break
+
     except TimeoutException:
         pass
     except Exception:
@@ -291,12 +362,13 @@ def calculate_subgraph_metrics(subG, bigG):
 
     supp_shape = len(unique_matches)
     conf = supp_neg / supp_shape if supp_shape > 0 else 0.0
-    
+
     return {
         'conf': conf,
         'supp_neg': supp_neg,
         'supp_shape': supp_shape,
-        'label': subG[target_u][target_v]['label']
+        'label': subG[target_u][target_v].get('label', 0),          # compressed
+        'raw_label': subG[target_u][target_v].get('raw_label', 0),  # original bitmask
     }
 
 # ==============================================================================
@@ -969,7 +1041,7 @@ class PPIGraphDataset(InMemoryDataset):
         pre_filter=None,
         num_subgraphs=2000,
         min_nodes=3,
-        max_nodes=5
+        max_nodes=5,
     ):
         self.num_subgraphs = num_subgraphs
         self.min_nodes = min_nodes
@@ -978,59 +1050,75 @@ class PPIGraphDataset(InMemoryDataset):
         self.stage = stage
 
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+
+        if self.stage == 'raw':
+            load_path = self.processed_paths[0]
+        else:
+            split_to_idx = {'train': 0, 'val': 1, 'test': 2}
+            if self.split not in split_to_idx:
+                raise ValueError(f"Unknown split: {self.split}")
+            load_path = self.processed_paths[split_to_idx[self.split]]
+
+        print(f"[Load] stage={self.stage}, split={self.split}, path={load_path}")
+        self.data, self.slices = torch.load(load_path)
 
     @property
     def raw_file_names(self):
         return ['protein_protein_with_type.csv', 'protein.csv']
 
-    # @property
-    # def processed_file_names(self):
-    #     return [f'ppi_{self.split}.pt']
-    # 区分两个阶段的训练数据
     @property
     def processed_file_names(self):
+        # raw 阶段只保留一个总池
         if self.stage == 'raw':
-            return [f'ppi_{self.split}_raw.pt']
-        return [f'ppi_{self.split}.pt']
+            return ['ppi_train_raw.pt']
+        # final 阶段按 train/val/test 三份保存
+        return ['ppi_train.pt', 'ppi_val.pt', 'ppi_test.pt']
 
     def download(self):
-        pass 
+        pass
 
     def process(self):
+        """
+        这里只负责构建 raw 池：ppi_train_raw.pt
+        final 的 train/val/test 切分由 train_ppi_order_and_pick.py 负责
+        """
+        if self.stage != 'raw':
+            print("[Info] stage='final' does not auto-generate final splits here.")
+            print("[Info] Please run train_ppi_order_and_pick.py to generate:")
+            print("       ppi_train.pt / ppi_val.pt / ppi_test.pt")
+            return
         ppi_path = os.path.join(self.root, 'raw', 'protein_protein_with_type.csv')
         meta_path = os.path.join(self.root, 'raw', 'protein.csv')
-        
+
         # --- A. 加载 Metadata ---
         print(f"Loading metadata from {meta_path}...")
-        id_to_attrs = {} 
+        id_to_attrs = {}
         try:
             df_meta = pd.read_csv(meta_path, low_memory=False)
             df_meta.columns = df_meta.columns.str.strip()
             id_col = 'biogrid_id'
-            
+
             df_meta[id_col] = pd.to_numeric(df_meta[id_col], errors='coerce')
             df_meta = df_meta.dropna(subset=[id_col])
-            
+
             for _, row in df_meta.iterrows():
                 bid = str(int(row[id_col]))
                 attr_dict = row.to_dict()
                 loc_raw = row.get('location', '')
-                attr_dict['cat_idx'] = map_loc_to_category(loc_raw) # 仅用于Legacy显示
+                attr_dict['cat_idx'] = map_loc_to_category(loc_raw)
                 id_to_attrs[bid] = attr_dict
             print(f"Metadata map built. Covered proteins: {len(id_to_attrs)}")
         except Exception as e:
             print(f"Error loading metadata: {e}")
             return
 
-                # --- B. 构建大图 ---
+        # --- B. 构建大图 ---
         print(f"Loading PPI structure from {ppi_path}...")
         bigG = nx.Graph()
         try:
             df_ppi = pd.read_csv(ppi_path, sep=',' if ',' in open(ppi_path).readline() else '\t')
             df_ppi.columns = df_ppi.columns.str.strip()
 
-            # 第一遍：只加点、加边，边 label 先占位 0
             for _, row in df_ppi.iterrows():
                 u_bid = str(row.get('BioGRID ID Interactor A', '')).split('.')[0]
                 v_bid = str(row.get('BioGRID ID Interactor B', '')).split('.')[0]
@@ -1043,24 +1131,19 @@ class PPIGraphDataset(InMemoryDataset):
                 loc_u = u_attrs.get('location', '')
                 loc_v = v_attrs.get('location', '')
 
-                u_enc = map_loc_to_category(loc_u)   # 0..9
+                u_enc = map_loc_to_category(loc_u)
                 v_enc = map_loc_to_category(loc_v)
 
-
-                # 添加节点
                 bigG.add_node(u_bid, **u_attrs, feature_val=u_enc)
                 bigG.add_node(v_bid, **v_attrs, feature_val=v_enc)
 
                 edge_data = row.to_dict()
+                bigG.add_edge(u_bid, v_bid, raw_label=0, label=0, **edge_data)
 
-                # 先占位，第二遍再用全局统计 + GNN + Affinity Capture-MS 规则重算
-                bigG.add_edge(u_bid, v_bid, label=0, **edge_data)
-
-            # --- B2. 计算节点统计量与全局分位数（给 x.degree / x.betweenness 的谓词用）---
             deg_dict = dict(bigG.degree())
             nx.set_node_attributes(bigG, deg_dict, "degree")
 
-            bet_dict = nx.betweenness_centrality(bigG,k=256,seed=42)
+            bet_dict = nx.betweenness_centrality(bigG, k=256, seed=42)
             nx.set_node_attributes(bigG, bet_dict, "betweenness_centrality")
 
             deg_vals = np.array(list(deg_dict.values()), dtype=float)
@@ -1070,15 +1153,14 @@ class PPIGraphDataset(InMemoryDataset):
                 "betweenness_centrality": {"q25": float(np.quantile(bet_vals, 0.25))}
             }
 
-            # --- B3. 准备 pred_scores（没有就先空着，不会影响流程）---
             pred_scores = {"GNN": {}}
             GNN_THRESHOLD = 0.5
 
-            # --- B4. 第二遍：重算边 label（严格按你的谓词策略）---
             for u, v, d in bigG.edges(data=True):
                 ux = bigG.nodes[u]
                 vy = bigG.nodes[v]
-                d["label"] = int(
+
+                raw_label = int(
                     encode_edge_feature(
                         id_x=u,
                         id_y=v,
@@ -1087,8 +1169,10 @@ class PPIGraphDataset(InMemoryDataset):
                         edge_row=d,
                         global_stats=global_stats
                     )
-
                 )
+
+                d["raw_label"] = raw_label
+                d["label"] = 0
 
         except Exception as e:
             print(f"Error building graph: {e}")
@@ -1098,42 +1182,39 @@ class PPIGraphDataset(InMemoryDataset):
 
         print(f"Big Graph loaded. Nodes: {bigG.number_of_nodes()}, Edges: {bigG.number_of_edges()}")
 
-    
         # --- C. 扫描负边 ---
         neg_edge_nodes = set()
         print("Scanning for negative edges to prioritize sampling...")
         for u, v, d in bigG.edges(data=True):
-            val = d.get('label', 0)
-            # [MODIFIED] 检查 Bit 7 (Is_Negative)
-            if val & (1 << EDGE_BIT_MAP['is_negative']):
+            raw_val = d.get('raw_label', 0)
+            if is_negative_raw_bitmask(raw_val):
                 neg_edge_nodes.add(u)
                 neg_edge_nodes.add(v)
-                
+
         neg_edge_nodes = list(neg_edge_nodes)
         print(f"Found {len(neg_edge_nodes)} nodes involved in negative edges.")
-        
+
         if len(neg_edge_nodes) == 0:
             print("Warning: No negative edges found! Sampling will be purely random.")
 
         # --- D. 采样与转换 ---
+        nx_subgraphs = []
         data_list = []
         all_nodes = list(bigG.nodes())
-        
+
         print(f"Sampling {self.num_subgraphs} subgraphs (Strategy: Negative-Centric)...")
-        
+
         pbar = tqdm(total=self.num_subgraphs)
         high_support_cnt = 0
         neg_sub_cnt = 0
-        
-        while len(data_list) < self.num_subgraphs:
-            # 80% 概率从负边区域采样
+
+        while len(nx_subgraphs) < self.num_subgraphs:
             use_biased_sampling = (len(neg_edge_nodes) > 0) and (np.random.rand() < 0.8)
             seed = np.random.choice(neg_edge_nodes) if use_biased_sampling else np.random.choice(all_nodes)
-            
+
             target_size = np.random.randint(self.min_nodes, self.max_nodes + 1)
             sub_nodes = [seed]
-            
-            # BFS 扩张
+
             try:
                 bfs_successors = dict(nx.bfs_successors(bigG, seed))
                 queue = [seed]
@@ -1148,79 +1229,118 @@ class PPIGraphDataset(InMemoryDataset):
                             if n not in sub_nodes:
                                 sub_nodes.append(n)
                                 queue.append(n)
-                                if len(sub_nodes) >= target_size: break
-            except: pass
-            
-            if len(sub_nodes) < self.min_nodes: continue
-                
+                                if len(sub_nodes) >= target_size:
+                                    break
+            except Exception:
+                pass
+
+            if len(sub_nodes) < self.min_nodes:
+                continue
+
             G_sub = bigG.subgraph(sub_nodes).copy()
 
-            # [MODIFIED] 检查子图是否包含负边 (使用新的位掩码逻辑)
             has_neg = False
             for _, _, d in G_sub.edges(data=True):
-                val = d.get('label', 0)
-                if val & (1 << EDGE_BIT_MAP['is_negative']):
+                raw_val = d.get('raw_label', 0)
+                if is_negative_raw_bitmask(raw_val):
                     has_neg = True
                     break
-            
+
             if has_neg:
                 neg_sub_cnt += 1
-                # 仅在包含负边时计算 Support
                 metrics = calculate_subgraph_metrics(G_sub, bigG)
                 if metrics and metrics['supp_shape'] >= MATCH_LIMIT:
                     high_support_cnt += 1
 
-            # 转 PyG
             G_sub = nx.convert_node_labels_to_integers(G_sub, label_attribute='orig_symbol')
-            pyg_data = self._to_pyg_data(G_sub)
-            if pyg_data: 
-                data_list.append(pyg_data)
-                pbar.update(1)
-        
+            nx_subgraphs.append(G_sub)
+            pbar.update(1)
+
         print(f"*Overall neg sub pattern: {neg_sub_cnt}")
         print(f"*Overall high support pattern: {high_support_cnt}")
-
         pbar.close()
 
-        if len(data_list) == 0:
+        if len(nx_subgraphs) == 0:
             print("[FATAL] No sampled subgraphs collected.")
+            return
+
+        # ===== 建立压缩映射 =====
+        global EDGE_LABEL_MAPPING, NUM_EDGE_CLASSES
+        EDGE_LABEL_MAPPING = build_edge_label_mapping(nx_subgraphs)
+        NUM_EDGE_CLASSES = EDGE_LABEL_MAPPING["num_edge_classes"]
+
+        print_edge_label_stats(nx_subgraphs, EDGE_LABEL_MAPPING)
+        import json
+
+        mapping_path = os.path.join(self.root, "processed", "edge_label_mapping.json")
+        payload = {
+            "bitmask_to_class": {str(k): int(v) for k, v in EDGE_LABEL_MAPPING["bitmask_to_class"].items()},
+            "class_to_bitmask": {str(k): int(v) for k, v in EDGE_LABEL_MAPPING["class_to_bitmask"].items()},
+            "num_edge_classes": int(EDGE_LABEL_MAPPING["num_edge_classes"]),
+            "used_masks": [int(x) for x in EDGE_LABEL_MAPPING["used_masks"]],
+        }
+
+        with open(mapping_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        print(f"[Saved] edge label mapping -> {mapping_path}")
+
+        # ===== raw_label -> compressed label =====
+        for G_sub in nx_subgraphs:
+            for u, v, d in G_sub.edges(data=True):
+                raw_label = int(d.get("raw_label", 0))
+                d["label"] = compress_edge_label(
+                    raw_label,
+                    EDGE_LABEL_MAPPING["bitmask_to_class"]
+                )
+
+        # ===== 转 PyG =====
+        for G_sub in nx_subgraphs:
+            pyg_data = self._to_pyg_data(G_sub)
+            if pyg_data is not None:
+                data_list.append(pyg_data)
+
+        if len(data_list) == 0:
+            print("[FATAL] No PyG subgraphs generated after compression.")
             return
 
         data, slices = self.collate(data_list)
         torch.save((data, slices), self.processed_paths[0])
-        print(f"[Done] Saved sampled subgraphs: {len(data_list)} -> {self.processed_paths[0]}")
+        print(f"[Done] Saved RAW sampled pool: {len(data_list)} -> {self.processed_paths[0]}")
 
     def _to_pyg_data(self, G):
-        # 1) 节点特征：feature_val (0..3) -> 4维 one-hot
+        global NUM_EDGE_CLASSES
+
+        if NUM_EDGE_CLASSES <= 0:
+            raise ValueError("NUM_EDGE_CLASSES is not initialized before _to_pyg_data.")
+
         xs = [G.nodes[n].get('feature_val', 9) for n in G.nodes()]
         x_idx = torch.tensor(xs, dtype=torch.long)
-        x = F.one_hot(x_idx, num_classes=NUM_NODE_CLASSES).float()  # [n, 4]
+        x = F.one_hot(x_idx, num_classes=NUM_NODE_CLASSES).float()
 
-        # 2) 构造有向边 + 特征
         src, dst = [], []
         edge_type_ids = []
         edge_bitmasks = []
 
-        # 先收集所有“候选 directed edges”
-        cand = []  # (s, t, edge_type, bitmask)
+        cand = []
         for u, v, d in G.edges(data=True):
-            bitmask = int(d.get('label', 0))     # 0..(2^k-1)
-            edge_type = bitmask + 1              # 1.. (预留 0 给 no-edge)
+            raw_bitmask = int(d.get('raw_label', 0))
+            edge_class = int(d.get('label', 0))
 
-            # 无向 -> 双向
-            cand.append((u, v, edge_type, bitmask))
-            cand.append((v, u, edge_type, bitmask))
+            cand.append((u, v, edge_class, raw_bitmask))
+            cand.append((v, u, edge_class, raw_bitmask))
 
         if not cand:
             return None
 
-        # 2.1) 去 self-loop + 去重 directed edge
         seen = set()
         dup = 0
         self_loops = 0
 
-        for s, t, et, bm in cand:
-            s = int(s); t = int(t)
+        for s, t, edge_class, raw_bitmask in cand:
+            s = int(s)
+            t = int(t)
+
             if s == t:
                 self_loops += 1
                 continue
@@ -1233,8 +1353,8 @@ class PPIGraphDataset(InMemoryDataset):
 
             src.append(s)
             dst.append(t)
-            edge_type_ids.append(int(et))
-            edge_bitmasks.append(int(bm))
+            edge_type_ids.append(edge_class)
+            edge_bitmasks.append(raw_bitmask)
 
         if len(src) == 0:
             return None
@@ -1244,17 +1364,13 @@ class PPIGraphDataset(InMemoryDataset):
         if dup > 0:
             print(f"[WARN] duplicate directed edges removed: {dup}")
 
-        # 2.2) 组装 PyG 张量
-        edge_index = torch.tensor([src, dst], dtype=torch.long)  # [2, E]
-        edge_type_ids = torch.tensor(edge_type_ids, dtype=torch.long)  # [E]
-        edge_attr = F.one_hot(edge_type_ids, num_classes=NUM_EDGE_CLASSES).float()  # [E, 129] 你这边是129
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        edge_type_ids = torch.tensor(edge_type_ids, dtype=torch.long)
+        edge_attr = F.one_hot(edge_type_ids, num_classes=NUM_EDGE_CLASSES).float()
+        edge_label_mask = torch.tensor(edge_bitmasks, dtype=torch.long)
 
-        edge_label_mask = torch.tensor(edge_bitmasks, dtype=torch.long)  # [E] debug
-
-        # 3) 最后再做一道硬检查：保证不会出现 num_edges > n*(n-1)
         n = G.number_of_nodes()
         if edge_index.size(1) > n * (n - 1):
-            # 理论上去重+去自环后不可能发生
             print(f"[FATAL] edges > n*(n-1): n={n}, E={edge_index.size(1)}")
             return None
 
@@ -1271,8 +1387,6 @@ class PPIGraphDataset(InMemoryDataset):
 
 
 
-
-
 # ==============================================================================
 # 3. DataModule & Infos (保持基本不变)
 # ==============================================================================
@@ -1285,14 +1399,19 @@ class PPIDataModule(AbstractDataModule):
         self.datadir = abs_datadir
         print(f"[Info] Absolute Data Directory: {self.datadir}")
 
-        final_path = os.path.join(self.datadir, "processed", "ppi_train.pt")
-        if not os.path.exists(final_path):
+        train_path = os.path.join(self.datadir, "processed", "ppi_train.pt")
+        val_path = os.path.join(self.datadir, "processed", "ppi_val.pt")
+        test_path = os.path.join(self.datadir, "processed", "ppi_test.pt")
+
+        missing = [p for p in [train_path, val_path, test_path] if not os.path.exists(p)]
+        if missing:
             raise FileNotFoundError(
-                f"Final PPI training set not found: {final_path}\n"
-                f"Please run: python src/preprocess/train_ppi_order_and_pick.py"
+                "Missing final PPI splits:\n"
+                + "\n".join(missing)
+                + "\nPlease run: python src/preprocess/train_ppi_order_and_pick.py"
             )
 
-        base_dataset = PPIGraphDataset(
+        train_dataset = PPIGraphDataset(
             root=self.datadir,
             split='train',
             stage='final',
@@ -1301,7 +1420,34 @@ class PPIDataModule(AbstractDataModule):
             max_nodes=cfg.dataset.max_nodes,
         )
 
-        datasets = {'train': base_dataset, 'val': base_dataset, 'test': base_dataset}
+        val_dataset = PPIGraphDataset(
+            root=self.datadir,
+            split='val',
+            stage='final',
+            num_subgraphs=cfg.dataset.num_subgraphs,
+            min_nodes=cfg.dataset.min_nodes,
+            max_nodes=cfg.dataset.max_nodes,
+        )
+
+        test_dataset = PPIGraphDataset(
+            root=self.datadir,
+            split='test',
+            stage='final',
+            num_subgraphs=cfg.dataset.num_subgraphs,
+            min_nodes=cfg.dataset.min_nodes,
+            max_nodes=cfg.dataset.max_nodes,
+        )
+
+        print(f"[Loaded] Train: {len(train_dataset)}")
+        print(f"[Loaded] Val:   {len(val_dataset)}")
+        print(f"[Loaded] Test:  {len(test_dataset)}")
+
+        datasets = {
+            'train': train_dataset,
+            'val': val_dataset,
+            'test': test_dataset
+        }
+
         super().__init__(cfg, datasets)
 
 class PPIDatasetInfos(AbstractDatasetInfos):
