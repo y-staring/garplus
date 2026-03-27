@@ -351,12 +351,29 @@ def build_big_graph_from_raw(raw_edge_file: str, raw_node_file: str, ml_threshol
 
 
 def node_match_fn(n1, n2) -> bool:
-    return (n1.get("feature_val") == n2.get("feature_val")) and (n1.get("deg", 0) <= n2.get("deg", 0))
+    return (n1.get("feature_val") == n2.get("feature_val")) #and (n1.get("deg", 0) <= n2.get("deg", 0))
 
 
 def edge_match_fn(d1, d2) -> bool:
     return int(d1.get("label", 0)) == int(d2.get("label", 0))
 
+def debug_iso_levels(bigG, premiseG, enable_node_match=False):
+    nm_func = node_match_fn if enable_node_match else None
+
+    GM0 = GraphMatcher(bigG, premiseG)
+    print("topology only:", GM0.subgraph_is_isomorphic())
+
+    GM_edge = GraphMatcher(bigG, premiseG, edge_match=edge_match_fn)
+    print("edge only:", GM_edge.subgraph_is_isomorphic())
+
+    if nm_func is not None:
+        GM_node = GraphMatcher(bigG, premiseG, node_match=nm_func)
+        print("node only:", GM_node.subgraph_is_isomorphic())
+    else:
+        print("node only: skipped (enable_node_match=False)")
+
+    GM_both = GraphMatcher(bigG, premiseG, node_match=nm_func, edge_match=edge_match_fn)
+    print("both:", GM_both.subgraph_is_isomorphic())
 
 def compute_rule_metrics_for_graph(
     graph_id: int,
@@ -395,10 +412,12 @@ def compute_rule_metrics_for_graph(
             continue
         print("if has iso:",has_iso)
         if not has_iso:
+            # debug_iso_levels(bigG,premiseG,enable_node_match)
             continue
 
         supp_premise = 0
         supp_negative = 0
+        supp_pattern = 0
         label_dist = Counter()
         updates = []
         status = "Finished"
@@ -421,6 +440,7 @@ def compute_rule_metrics_for_graph(
                     if bool(real_label & (1 << EDGE_BIT_MAP["is_negative"])):
                         supp_negative += 1
                     elif real_label == 0:
+                        supp_pattern += 1
                         updates.append((str(real_u), str(real_v)))
 
                     if supp_premise >= match_limit:
@@ -428,12 +448,14 @@ def compute_rule_metrics_for_graph(
                         break
         except TimeoutException:
             status = "TimeOut"
-        print("supp_premise:",supp_premise,"supp_negative",supp_negative)
+        print("supp_premise:",supp_premise,"supp_pattern:",supp_pattern,"supp_negative",supp_negative)
         if supp_premise == 0:
             continue
         print("status:",status)
-        confidence = supp_negative / supp_premise
-        if confidence >= confidence_threshold and supp_premise >= support_threshold:
+        # confidence = supp_negative / supp_premise
+        # if confidence >= confidence_threshold and supp_premise >= support_threshold:
+        confidence = supp_pattern / supp_premise
+        if confidence >= confidence_threshold and supp_pattern >= support_threshold:
             metrics.append(
                 RuleMetric(
                     graph_id=graph_id,
@@ -524,6 +546,141 @@ def extract_negative_centered_triads(
 
     return triads
 
+def inspect_mapping_roundtrip(edge_mapping: Dict):
+    print("\n=== [1] edge mapping roundtrip ===")
+    bad = []
+    classes = sorted(int(k) for k in edge_mapping["class_to_bitmask"].keys())
+    masks = sorted(int(k) for k in edge_mapping["bitmask_to_class"].keys())
+
+    for c in classes:
+        m = edge_class_to_raw_bitmask(c, edge_mapping)
+        c2 = raw_bitmask_to_edge_class(m, edge_mapping)
+        if c != c2:
+            bad.append((c, m, c2))
+
+    print("classes:", classes[:30], "..." if len(classes) > 30 else "")
+    print("used raw bitmasks:", masks[:30], "..." if len(masks) > 30 else "")
+    print("roundtrip error count:", len(bad))
+    if bad:
+        print("sample roundtrip errors:", bad[:20])
+
+
+def summarize_graph_space(G: nx.Graph, name: str):
+    node_vals = Counter(int(d.get("feature_val", -1)) for _, d in G.nodes(data=True))
+    edge_vals = Counter(int(d.get("label", 0)) for _, _, d in G.edges(data=True))
+
+    print(f"\n=== [{name}] graph space summary ===")
+    print("num_nodes:", G.number_of_nodes())
+    print("num_edges:", G.number_of_edges())
+    print("node feature values:", sorted(node_vals.keys()))
+    print("edge label values:", sorted(edge_vals.keys()))
+    print("top node feature counts:", node_vals.most_common(20))
+    print("top edge label counts:", edge_vals.most_common(20))
+
+    return {
+        "node_values": set(node_vals.keys()),
+        "edge_values": set(edge_vals.keys()),
+        "node_counter": node_vals,
+        "edge_counter": edge_vals,
+    }
+
+
+def summarize_parsed_space(parsed, edge_mapping: Dict, max_graphs: int = None):
+    all_node_vals = Counter()
+    all_edge_vals = Counter()
+    all_edge_classes = Counter()
+    bad_graphs = []
+
+    graphs = parsed if max_graphs is None else parsed[:max_graphs]
+
+    for gid, (x_list, edge_matrix) in enumerate(graphs):
+        if len(x_list) != len(edge_matrix):
+            bad_graphs.append((gid, "len(x_list) != len(edge_matrix)", len(x_list), len(edge_matrix)))
+            continue
+
+        for x in x_list:
+            all_node_vals[int(x)] += 1
+
+        n = len(edge_matrix)
+        for i in range(n):
+            if len(edge_matrix[i]) != n:
+                bad_graphs.append((gid, "edge_matrix not square", i, len(edge_matrix[i]), n))
+                continue
+            for j in range(i + 1, n):
+                cls = int(edge_matrix[i][j])
+                if cls != 0:
+                    all_edge_classes[cls] += 1
+                raw = edge_class_to_raw_bitmask(cls, edge_mapping)
+                if raw != 0:
+                    all_edge_vals[raw] += 1
+
+    print("\n=== [parsed_graphs] parsed space summary ===")
+    print("num_graphs:", len(graphs))
+    print("node feature values:", sorted(all_node_vals.keys()))
+    print("edge classes in txt:", sorted(all_edge_classes.keys()))
+    print("edge labels(after class->raw bitmask):", sorted(all_edge_vals.keys()))
+    print("top node feature counts:", all_node_vals.most_common(20))
+    print("top edge class counts:", all_edge_classes.most_common(20))
+    print("top edge raw-label counts:", all_edge_vals.most_common(20))
+    print("bad graph count:", len(bad_graphs))
+    if bad_graphs:
+        print("sample bad graphs:", bad_graphs[:20])
+
+    return {
+        "node_values": set(all_node_vals.keys()),
+        "edge_class_values": set(all_edge_classes.keys()),
+        "edge_values": set(all_edge_vals.keys()),
+        "node_counter": all_node_vals,
+        "edge_class_counter": all_edge_classes,
+        "edge_counter": all_edge_vals,
+        "bad_graphs": bad_graphs,
+    }
+
+
+def compare_spaces(big_summary: Dict, parsed_summary: Dict):
+    print("\n=== [compare] parsed_graph vs bigG ===")
+
+    parsed_only_nodes = sorted(parsed_summary["node_values"] - big_summary["node_values"])
+    big_only_nodes = sorted(big_summary["node_values"] - parsed_summary["node_values"])
+    parsed_only_edges = sorted(parsed_summary["edge_values"] - big_summary["edge_values"])
+    big_only_edges = sorted(big_summary["edge_values"] - parsed_summary["edge_values"])
+
+    print("parsed-only node feature values:", parsed_only_nodes)
+    print("bigG-only node feature values:", big_only_nodes)
+    print("parsed-only edge raw labels:", parsed_only_edges)
+    print("bigG-only edge raw labels:", big_only_edges)
+
+    node_ok = len(parsed_only_nodes) == 0
+    edge_ok = len(parsed_only_edges) == 0
+
+    print("node space covered by bigG:", node_ok)
+    print("edge space covered by bigG:", edge_ok)
+
+    if node_ok and edge_ok:
+        print(">>> 编码空间从取值域上看是一致/可兼容的")
+    else:
+        print(">>> 编码空间不完全一致，优先看 parsed-only 的值")
+
+
+def inspect_parsed_graph_legality(parsed, edge_mapping: Dict, bigG: nx.Graph, max_graphs: int = 20):
+    big_node_vals = {int(d.get("feature_val", -1)) for _, d in bigG.nodes(data=True)}
+    big_edge_vals = {int(d.get("label", 0)) for _, _, d in bigG.edges(data=True)}
+
+    print("\n=== [detail] per-parsed-graph legality ===")
+    for gid, (x_list, edge_matrix) in enumerate(parsed[:max_graphs]):
+        g = to_nx_graph(x_list, edge_matrix, edge_mapping)
+
+        node_vals = {int(d.get("feature_val", -1)) for _, d in g.nodes(data=True)}
+        edge_vals = {int(d.get("label", 0)) for _, _, d in g.edges(data=True)}
+
+        bad_nodes = sorted(node_vals - big_node_vals)
+        bad_edges = sorted(edge_vals - big_edge_vals)
+
+        print(
+            f"graph={gid} "
+            f"nodes={g.number_of_nodes()} edges={g.number_of_edges()} "
+            f"bad_node_vals={bad_nodes} bad_edge_vals={bad_edges}"
+        )
 
 def run_pipeline(cfg: PipelineConfig):
     edge_mapping = load_edge_label_mapping(cfg.edge_label_mapping)
@@ -535,6 +692,15 @@ def run_pipeline(cfg: PipelineConfig):
         raise ValueError("reference_source must be 'train_data' or 'raw_csv_graph'")
 
     parsed = parse_graph_txt(cfg.generated_sample_file)
+    # inspect_mapping_roundtrip(edge_mapping)
+
+    # big_summary = summarize_graph_space(bigG, "bigG")
+    # parsed_summary = summarize_parsed_space(parsed, edge_mapping)
+
+    # compare_spaces(big_summary, parsed_summary)
+
+    # # 看前 20 个 parsed graph 的逐图合法性
+    # inspect_parsed_graph_legality(parsed, edge_mapping, bigG, max_graphs=20)
     all_rule_metrics: List[RuleMetric] = []
     all_updates: List[Tuple[str, str]] = []
 
@@ -606,7 +772,7 @@ if __name__ == "__main__":
     # 不使用命令行参数；直接在这里改配置即可运行
     config = PipelineConfig(
         generated_sample_file="/home/yyyy/codework/GARplus/DiGress/outputs/2026-03-25/21-57-41-ppi_gar/generated_samples1.txt",
-        reference_source="raw_csv_graph",
+        reference_source="raw_csv_graph",  #
         raw_edge_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein_protein_with_type.csv",
         raw_node_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein.csv",
         edge_label_mapping="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/processed/edge_label_mapping.json",

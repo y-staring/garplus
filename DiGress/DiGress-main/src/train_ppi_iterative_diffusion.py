@@ -23,7 +23,7 @@ from datasets.ppi_dataset_order_embedding import (
     map_loc_to_category,
     encode_edge_feature,
     compress_edge_label,
-    calculate_subgraph_metrics,
+    # calculate_subgraph_metrics,
     is_negative_raw_bitmask,
 )
 from analysis.visualization import NonMolecularVisualization
@@ -32,6 +32,12 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 
+from analysis.ppi_rule_utils import (
+    build_updated_edge_file_with_random_negatives,
+    build_reference_big_graph,
+    compute_rule_metrics_for_graph,
+    save_negative_edges_csv,
+)
 
 # ============================================================
 # 可调参数（第一版先写死，后面你可以再 Hydra 化）
@@ -350,31 +356,67 @@ def generate_candidate_graphs(model, edge_mapping, total_to_generate, batch_size
 # ============================================================
 # 7) 规则筛选
 # ============================================================
-def filter_generated_graphs(generated_graphs, bigG, keep_only_negative_rule=True):
+# def filter_generated_graphs(generated_graphs, bigG, keep_only_negative_rule=True):
+def filter_generated_graphs(
+    generated_graphs,
+    bigG,
+    keep_only_negative_rule=True,
+    confidence_threshold=0.0,
+    support_threshold=1,
+    match_limit=400,
+    time_limit=5,
+    enable_node_match=True,
+):
     kept = []
     metrics_log = []
+    matched_negative_edges = set()
+
+
 
     for data in generated_graphs:
         nx_g = pyg_to_nx_for_rule_check(data)
 
-        has_neg = False
-        for _, _, d in nx_g.edges(data=True):
-            if is_negative_raw_bitmask(d.get("raw_label", 0)):
-                has_neg = True
-                break
-
+        # has_neg = False
+        # for _, _, d in nx_g.edges(data=True):
+        #     if is_negative_raw_bitmask(d.get("raw_label", 0)):
+        #         has_neg = True
+        #         break
+        has_neg = any(is_negative_raw_bitmask(d.get("raw_label", 0)) for _, _, d in nx_g.edges(data=True))
         if keep_only_negative_rule and not has_neg:
             continue
 
-        m = calculate_subgraph_metrics(nx_g, bigG)
+
+        m = compute_rule_metrics_for_graph(
+                    subG=nx_g,
+                    bigG=bigG,
+                    match_limit=match_limit,
+                    time_limit=time_limit,
+                    confidence_threshold=confidence_threshold,
+                    support_threshold=support_threshold,
+                    # denominator_mode=denominator_mode,
+                    enable_node_match=enable_node_match,
+                    keep_only_negative_rule=keep_only_negative_rule,
+                )
         if m is None:
             continue
 
         kept.append(data)
-        metrics_log.append(m)
+        # metrics_log.append(m)
+        metrics_log.append({
+            "conf": m.confidence,
+            "supp_neg": m.support_negative,
+            "supp_base": m.support_base,
+            "supp_shape": m.support_shape,
+            "status": m.status,
+            "denominator_mode": m.denominator_mode,
+            "matched_negative_edges": m.matched_negative_edges,
+        })
+        matched_negative_edges.update(tuple(edge) for edge in m.matched_negative_edges)
 
     print(f"[Filter] kept {len(kept)} / {len(generated_graphs)}")
-    return kept, metrics_log
+    # return kept, metrics_log
+    return kept, metrics_log, sorted(matched_negative_edges)
+
 
 
 # ============================================================
@@ -529,7 +571,29 @@ def main(cfg: DictConfig):
     sample_batch_size = cfg.iterative.sample_batch_size
     keep_only_negative_rule = cfg.iterative.keep_only_negative_rule
     dedup_against_history = cfg.iterative.dedup_against_history
-
+    reference_source = cfg.iterative.reference_source
+    reference_split = cfg.iterative.reference_split
+    raw_edge_file = cfg.iterative.raw_edge_file
+    raw_node_file = cfg.iterative.raw_node_file
+    ml_threshold = cfg.iterative.ml_threshold
+    confidence_threshold = cfg.iterative.confidence_threshold
+    support_threshold = cfg.iterative.support_threshold
+    rule_match_limit = cfg.iterative.rule_match_limit
+    rule_time_limit = cfg.iterative.rule_time_limit
+    # rule_denominator_mode = cfg.iterative.rule_denominator_mode
+    enable_node_match = cfg.iterative.enable_node_match
+    export_discovered_negative_edges = cfg.iterative.export_discovered_negative_edges
+    discovered_negative_edges_file = cfg.iterative.discovered_negative_edges_file
+    edge_old_file = cfg.iterative.edge_old_file
+    edge_updated_output_file = cfg.iterative.edge_updated_output_file
+    edge_src_col = cfg.iterative.edge_src_col
+    edge_dst_col = cfg.iterative.edge_dst_col
+    edge_rel_col = cfg.iterative.edge_rel_col
+    edge_rel_name = cfg.iterative.edge_rel_name
+    edge_label_col = cfg.iterative.edge_label_col
+    edge_negative_label = cfg.iterative.edge_negative_label
+    num_additional_negatives = cfg.iterative.num_additional_negatives
+    random_seed = cfg.iterative.random_seed
     datasets_dir = os.path.join(run_root, "datasets")
     checkpoints_dir = os.path.join(run_root, "checkpoints")
     metrics_dir = os.path.join(run_root, "metrics")
@@ -552,7 +616,7 @@ def main(cfg: DictConfig):
 
     current_train_pt = init_copy_path
     resume_ckpt = None
-
+    all_discovered_negative_edges = set()
     for round_id in range(outer_rounds):
         print("\n" + "=" * 100)
         print(f"[Round {round_id}] current_train_pt = {current_train_pt}")
@@ -579,12 +643,19 @@ def main(cfg: DictConfig):
             batch_size=sample_batch_size
         )
 
-        kept, metrics_log = filter_generated_graphs(
+        kept, metrics_log, matched_negative_edges = filter_generated_graphs(
             generated_graphs=generated,
             bigG=bigG,
-            keep_only_negative_rule=keep_only_negative_rule
+            keep_only_negative_rule=keep_only_negative_rule,
+            confidence_threshold=confidence_threshold,
+            support_threshold=support_threshold,
+            match_limit=rule_match_limit,
+            time_limit=rule_time_limit,
+            # denominator_mode=rule_denominator_mode,
+            enable_node_match=enable_node_match,
         )
-
+        all_discovered_negative_edges.update(tuple(edge) for edge in matched_negative_edges)
+        print(len(all_discovered_negative_edges))
         metrics_json = os.path.join(metrics_dir, f"iter_{round_id}_metrics.json")
         with open(metrics_json, "w", encoding="utf-8") as f:
             json.dump(metrics_log, f, indent=2)
@@ -608,6 +679,36 @@ def main(cfg: DictConfig):
 
         current_train_pt = next_train_pt
         resume_ckpt = last_ckpt
+
+        if export_discovered_negative_edges:
+            save_negative_edges_csv(
+                negative_edges=sorted(all_discovered_negative_edges),
+                output_path=discovered_negative_edges_file,
+                src_col=edge_src_col,
+                dst_col=edge_dst_col,
+                rel_col=edge_rel_col,
+                rel_name=edge_rel_name,
+                label_col=edge_label_col,
+                negative_label=edge_negative_label,
+            )
+            print(f"[Done] discovered negative edges saved -> {discovered_negative_edges_file}")
+
+            if edge_old_file:
+                build_updated_edge_file_with_random_negatives(
+                    edge_old_file=edge_old_file,
+                    discovered_negative_edges=sorted(all_discovered_negative_edges),
+                    output_path=edge_updated_output_file,
+                    src_col=edge_src_col,
+                    dst_col=edge_dst_col,
+                    rel_col=edge_rel_col,
+                    rel_name=edge_rel_name,
+                    label_col=edge_label_col,
+                    negative_label=edge_negative_label,
+                    num_additional_negatives=num_additional_negatives,
+                    random_seed=random_seed,
+                )
+                print(f"[Done] updated edge file saved -> {edge_updated_output_file}")
+
 
     print("[Done] iterative diffusion training finished.")
 
