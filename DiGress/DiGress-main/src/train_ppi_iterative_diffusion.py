@@ -75,19 +75,36 @@ class DynamicPPIDataset(InMemoryDataset):
         pass
 
 
-class DynamicPPIDataModule(utils.LightningDataset if hasattr(utils, "LightningDataset") else object):
-    """
-    为了尽量少改你现有代码，这里不用继承你的 PPIDataModule，
-    直接复用 AbstractDataModule 的逻辑。
-    """
-    def __init__(self, cfg, pt_path):
-        from src.datasets.abstract_dataset import AbstractDataModule
-        dataset = DynamicPPIDataset(pt_path)
-        datasets = {"train": dataset, "val": dataset, "test": dataset}
-        self._inner = AbstractDataModule(cfg, datasets)
+# class DynamicPPIDataModule(utils.LightningDataset if hasattr(utils, "LightningDataset") else object):
+#     """
+#     为了尽量少改你现有代码，这里不用继承你的 PPIDataModule，
+#     直接复用 AbstractDataModule 的逻辑。
+#     """
+#     def __init__(self, cfg, pt_path):
+#         from src.datasets.abstract_dataset import AbstractDataModule
+#         dataset = DynamicPPIDataset(pt_path)
+#         datasets = {"train": dataset, "val": dataset, "test": dataset}
+#         self._inner = AbstractDataModule(cfg, datasets)
 
-    def __getattr__(self, item):
-        return getattr(self._inner, item)
+#     def __getattr__(self, item):
+#         # deepcopy/serialization 阶段可能在 _inner 尚未存在时触发 __getattr__，
+#         # 这里避免无限递归。
+#         inner = self.__dict__.get("_inner", None)
+#         if inner is None:
+#             raise AttributeError(item)
+#         return getattr(inner, item)
+
+def build_dynamic_datamodule(cfg, pt_path):
+    """
+    为了尽量少改你现有代码，这里不用继承你的 PPIDataModule,
+    直接返回 AbstractDataModule 实例，避免 wrapper 在 Lightning/PyTorch 深拷贝阶段
+    被误识别为 dataloader 或触发 __getattr__ 递归。
+    """
+    from src.datasets.abstract_dataset import AbstractDataModule
+    dataset = DynamicPPIDataset(pt_path)
+    datasets = {"train": dataset, "val": dataset, "test": dataset}
+    return AbstractDataModule(cfg, datasets)
+
 
 
 # ============================================================
@@ -189,6 +206,7 @@ def build_big_graph_from_raw(datadir, edge_mapping):
             )
         )
         d["raw_label"] = raw_label
+        # d["label"] = raw_label
         d["label"] = compress_edge_label(raw_label, edge_mapping["bitmask_to_class"])
 
     print(f"[Build bigG] done. nodes={bigG.number_of_nodes()}, edges={bigG.number_of_edges()}")
@@ -314,11 +332,39 @@ def load_data_list_from_pt(pt_path):
 
 
 def save_data_list_to_pt(data_list, out_path):
-    tmp_ds = DynamicPPIDataset.__new__(DynamicPPIDataset)
-    data, slices = InMemoryDataset.collate(tmp_ds, data_list)
+    # torch_geometric 版本差异兼容：
+    # - 新版: InMemoryDataset.collate(data_list)
+    # - 旧版: dataset_instance.collate(data_list)
+    try:
+        data, slices = InMemoryDataset.collate(data_list)
+    except TypeError:
+        tmp_ds = DynamicPPIDataset.__new__(DynamicPPIDataset)
+        data, slices = tmp_ds.collate(data_list)
     torch.save((data, slices), out_path)
 
+def save_generated_graphs_txt(graphs, output_file):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        for data in graphs:
+            n = int(data.num_nodes)
+            x_list = data.x.argmax(dim=-1).cpu().tolist()
+            edge_labels = data.edge_attr.argmax(dim=-1).cpu().tolist()
 
+            E = [[0 for _ in range(n)] for _ in range(n)]
+            for eid in range(data.edge_index.size(1)):
+                u = int(data.edge_index[0, eid])
+                v = int(data.edge_index[1, eid])
+                if u == v:
+                    continue
+                E[u][v] = int(edge_labels[eid])
+
+            f.write(f"N={n}\n")
+            f.write("X:\n")
+            f.write(" ".join(map(str, x_list)) + "\n")
+            f.write("E:\n")
+            for row in E:
+                f.write(" ".join(map(str, row)) + "\n")
+            f.write("\n")
 # ============================================================
 # 6) 生成候选图
 # ============================================================
@@ -405,10 +451,10 @@ def filter_generated_graphs(
         metrics_log.append({
             "conf": m.confidence,
             "supp_neg": m.support_negative,
-            "supp_base": m.support_base,
+            # "supp_base": m.support_base,
             "supp_shape": m.support_shape,
             "status": m.status,
-            "denominator_mode": m.denominator_mode,
+            # "denominator_mode": m.denominator_mode,
             "matched_negative_edges": m.matched_negative_edges,
         })
         matched_negative_edges.update(tuple(edge) for edge in m.matched_negative_edges)
@@ -491,7 +537,8 @@ def build_ppi_components(cfg, datamodule):
 # 10) 单轮训练
 # ============================================================
 def train_one_round(cfg, train_pt_path, round_id, run_checkpoints_dir, resume_ckpt=None):
-    datamodule = DynamicPPIDataModule(cfg, train_pt_path)
+    # datamodule = DynamicPPIDataModule(cfg, train_pt_path)
+    datamodule = build_dynamic_datamodule(cfg, train_pt_path)
     model_kwargs = build_ppi_components(cfg, datamodule)
 
     if cfg.model.type == 'discrete':
@@ -517,6 +564,17 @@ def train_one_round(cfg, train_pt_path, round_id, run_checkpoints_dir, resume_ck
             every_n_epochs=1
         )
         callbacks.extend([last_ckpt_save, checkpoint_callback])
+        # checkpoint_callback = ModelCheckpoint(
+        # dirpath=ckpt_dir,
+        # filename='{epoch}',
+        # monitor='val/epoch_NLL',
+        # save_top_k=5,
+        # mode='min',
+        # every_n_epochs=1,
+        # save_last=True,
+        # )
+
+        # callbacks.append(checkpoint_callback)
 
     if cfg.train.ema_decay > 0:
         ema_callback = utils.EMA(decay=cfg.train.ema_decay)
@@ -536,13 +594,24 @@ def train_one_round(cfg, train_pt_path, round_id, run_checkpoints_dir, resume_ck
         log_every_n_steps=50 if cfg.general.name != 'debug' else 1,
         logger=[]
     )
-
+    print("cfg.general.check_val_every_n_epochs=",cfg.general.check_val_every_n_epochs)
+    print("cfg.train.save_model =", cfg.train.save_model)
+    print("ckpt_dir =", ckpt_dir)
+    print("callbacks =", [type(cb).__name__ for cb in callbacks])
     trainer.fit(model, datamodule=datamodule, ckpt_path=resume_ckpt)
-
+    print("checkpoint dir exists:", os.path.exists(ckpt_dir))
+    print("checkpoint dir files:", os.listdir(ckpt_dir) if os.path.exists(ckpt_dir) else [])
+    import glob
     last_ckpt_path = os.path.join(ckpt_dir, "last.ckpt")
     if not os.path.exists(last_ckpt_path):
-        raise FileNotFoundError(f"last.ckpt not found after round {round_id}: {last_ckpt_path}")
-
+        # raise FileNotFoundError(f"last.ckpt not found after round {round_id}: {last_ckpt_path}")
+        candidates = sorted(glob.glob(os.path.join(ckpt_dir, "last*.ckpt")))
+        if not candidates:
+            candidates = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")), key=os.path.getmtime)
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoint found after round {round_id} under: {ckpt_dir}")
+        last_ckpt_path = candidates[-1]
+        print(f"[Round {round_id}] last.ckpt not found, fallback checkpoint -> {last_ckpt_path}")
     return model, datamodule, last_ckpt_path
 
 
@@ -594,6 +663,10 @@ def main(cfg: DictConfig):
     edge_negative_label = cfg.iterative.edge_negative_label
     num_additional_negatives = cfg.iterative.num_additional_negatives
     random_seed = cfg.iterative.random_seed
+    save_generated_txt = cfg.iterative.save_generated_txt
+    save_filtered_generated_txt = cfg.iterative.save_filtered_generated_txt
+
+
     datasets_dir = os.path.join(run_root, "datasets")
     checkpoints_dir = os.path.join(run_root, "checkpoints")
     metrics_dir = os.path.join(run_root, "metrics")
@@ -642,6 +715,12 @@ def main(cfg: DictConfig):
             total_to_generate=generate_per_round,
             batch_size=sample_batch_size
         )
+        # 生成图是带compressed label的
+        if save_generated_txt:
+            generated_txt = os.path.join(generated_dir, f"iter_{round_id}_generated_samples.txt")
+            save_generated_graphs_txt(generated, generated_txt)
+            print(f"[Round {round_id}] saved generated txt -> {generated_txt}")
+
 
         kept, metrics_log, matched_negative_edges = filter_generated_graphs(
             generated_graphs=generated,
@@ -655,6 +734,12 @@ def main(cfg: DictConfig):
             enable_node_match=enable_node_match,
         )
         all_discovered_negative_edges.update(tuple(edge) for edge in matched_negative_edges)
+        if save_filtered_generated_txt:
+            kept_txt = os.path.join(generated_dir, f"iter_{round_id}_generated_samples_filtered.txt")
+            save_generated_graphs_txt(kept, kept_txt)
+            print(f"[Round {round_id}] saved filtered generated txt -> {kept_txt}")
+
+        #TODO  把子图的压缩编码也解码回去，就对上了？
         print(len(all_discovered_negative_edges))
         metrics_json = os.path.join(metrics_dir, f"iter_{round_id}_metrics.json")
         with open(metrics_json, "w", encoding="utf-8") as f:

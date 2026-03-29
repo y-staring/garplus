@@ -23,7 +23,7 @@ from src.datasets.ppi_dataset_order_embedding import (
 class RuleMetric:
     confidence: float
     support_negative: int
-    support_base: int
+    # support_base: int
     support_shape: int
     status: str
     has_negative_target: bool
@@ -181,7 +181,7 @@ def compute_rule_metrics_for_graph(
     time_limit: int,
     confidence_threshold: float,
     support_threshold: int,
-    denominator_mode: str,
+    # denominator_mode: str,
     enable_node_match: bool,
     keep_only_negative_rule: bool,
 ) -> Optional[RuleMetric]:

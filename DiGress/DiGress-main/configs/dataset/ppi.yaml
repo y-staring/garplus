@@ -3,8 +3,8 @@
 
 name: ppi
 datadir: data/PPI  # 确保这个路径存在
-max_nodes: 6
-min_nodes: 3
+max_nodes: 10
+min_nodes: 5
 num_subgraphs: 2000     # 正常训练时的数量
 # num_bins: 45           # 节点特征分箱
 # neg_sample_ratio: 0.8

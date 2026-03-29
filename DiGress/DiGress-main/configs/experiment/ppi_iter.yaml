@@ -8,7 +8,7 @@ general:
   test_only: null
   
   # === 验证与采样频率 ===
-  check_val_every_n_epochs: 500   # 每 50 个 epoch 验证一次
+  check_val_every_n_epochs: 50   # 每 50 个 epoch 验证一次
   sample_every_val: 10           # 每 10 次验证采样一次 (即每 500 epochs)
   samples_to_generate: 20        # 验证时生成的图数量
   samples_to_save: 20            # 保存到硬盘的数量
@@ -56,10 +56,10 @@ model:
 paths:
   source_datadir: /home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI
   source_train_pt: /home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/processed/ppi_train.pt
-  run_root: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp01
+  run_root: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02
 
 iterative:
-  outer_rounds: 3
+  outer_rounds: 2
   epochs_per_round: 50
   generate_per_round: 200
   max_new_per_round: 100
@@ -87,11 +87,11 @@ iterative:
 
   # save discovered real negative edges (from matched real_label) for downstream update
   export_discovered_negative_edges: true
-  discovered_negative_edges_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi_iter_exp01/metrics/discovered_negative_edges.csv
+  discovered_negative_edges_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02/metrics/discovered_negative_edges.csv
 
   # if set, build: edge_old + discovered negatives + random negatives
   edge_old_file: ""
-  edge_updated_output_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi_iter_exp01/metrics/edge_random_new.csv
+  edge_updated_output_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02/metrics/edge_random_new.csv
   edge_src_col: src
   edge_dst_col: dst
   edge_rel_col: rel
@@ -100,3 +100,8 @@ iterative:
   edge_negative_label: 2
   num_additional_negatives: 0
   random_seed: 42
+
+  
+  # save generated graphs in txt format like single-run generated_samples*.txt
+  save_generated_txt: true
+  save_filtered_generated_txt: true

@@ -505,8 +505,8 @@ def apply_updates_to_ppi(raw_edge_file: str, output_file: str, update_pairs: Lis
             df.loc[len(df)] = new_row
             appended += 1
 
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    df.to_csv(output_file, index=False)
+    # os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    # df.to_csv(output_file, index=False)
     return modified, appended
 
 def is_negative_label(label: int) -> bool:
@@ -764,20 +764,21 @@ def run_pipeline(cfg: PipelineConfig):
 
     if cfg.update_ppi and all_updates:
         modified, appended = apply_updates_to_ppi(cfg.raw_edge_file, cfg.update_edge_file, all_updates)
-        print(f"Updated PPI file saved to: {cfg.update_edge_file}")
+        # print(f"Updated PPI file saved to: {cfg.update_edge_file}")
         print(f"Modified existing rows: {modified}, appended rows: {appended}")
 
 
 if __name__ == "__main__":
     # 不使用命令行参数；直接在这里改配置即可运行
     config = PipelineConfig(
-        generated_sample_file="/home/yyyy/codework/GARplus/DiGress/outputs/2026-03-25/21-57-41-ppi_gar/generated_samples1.txt",
+        # generated_sample_file="/home/yyyy/codework/GARplus/DiGress/outputs/2026-03-25/21-57-41-ppi_gar/generated_samples1.txt",
+        generated_sample_file="/home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp01/generated/iter_1_generated_samples_filtered.txt",
         reference_source="raw_csv_graph",  #
         raw_edge_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein_protein_with_type.csv",
         raw_node_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein.csv",
         edge_label_mapping="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/processed/edge_label_mapping.json",
         update_edge_file="",
-        update_ppi=False,
+        update_ppi=True,
     )
     if not config.generated_sample_file:
         raise ValueError("Please set PipelineConfig.generated_sample_file before running.")
