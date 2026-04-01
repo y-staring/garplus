@@ -1,0 +1,38 @@
+output_dir: ~/nbfnet_results
+
+dataset:
+  class: MyDataset
+  path: ~/NBFNet/data_updated/my_dataset
+
+task:
+  class: KnowledgeGraphCompletion
+  model:
+    class: NBFNet
+    input_dim: 32
+    hidden_dims: [32, 32]
+    message_func: distmult
+    aggregate_func: pna
+    short_cut: yes
+    layer_norm: yes
+    dependent: no
+  criterion: bce
+  # num_negative: 32
+  margin: 6.0
+  adversarial_temperature: 1.0
+  strict_negative: yes
+  sample_weight: no
+  full_batch_eval: yes
+
+optimizer:
+  class: Adam
+  lr: 5.0e-3
+
+engine:
+  gpus: [0]  # 如果是多卡或改变卡号可修改
+  batch_size: 64
+
+train:
+  num_epoch: 1  # 根据数据规模调整
+
+
+metric: mrr
