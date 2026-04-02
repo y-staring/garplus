@@ -31,6 +31,7 @@ from analysis.spectre_utils import SpectreSamplingMetrics
 import pandas as pd
 import numpy as np
 import networkx as nx
+from networkx.algorithms import isomorphism
 
 from analysis.ppi_rule_utils import (
     build_updated_edge_file_with_random_negatives,
@@ -464,6 +465,54 @@ def filter_generated_graphs(
     return kept, metrics_log, sorted(matched_negative_edges)
 
 
+def _is_subgraph_contained(candidate_subgraph, candidate_supergraph):
+    node_match = isomorphism.categorical_node_match("feature_val", None)
+    edge_match = isomorphism.categorical_edge_match("raw_label", None)
+    matcher = isomorphism.GraphMatcher(
+        candidate_supergraph,
+        candidate_subgraph,
+        node_match=node_match,
+        edge_match=edge_match,
+    )
+    return matcher.subgraph_is_isomorphic()
+
+
+def prune_graph_entries_by_containment(graph_entries):
+    """
+    输入 graph_entries: [{"data": Data, "nx_g": nx.Graph, "metrics": dict}, ...]
+    规则：当图 A 包含图 B 时，只保留 B（删除 A）。
+    """
+    n = len(graph_entries)
+    if n <= 1:
+        return graph_entries
+
+    remove_flags = [False] * n
+    sizes = [
+        (entry["nx_g"].number_of_nodes(), entry["nx_g"].number_of_edges())
+        for entry in graph_entries
+    ]
+
+    for i in range(n):
+        if remove_flags[i]:
+            continue
+        ni, ei = sizes[i]
+        Gi = graph_entries[i]["nx_g"]
+        for j in range(n):
+            if i == j or remove_flags[i]:
+                continue
+            nj, ej = sizes[j]
+            if ni < nj or ei < ej:
+                continue
+
+            Gj = graph_entries[j]["nx_g"]
+            if _is_subgraph_contained(candidate_subgraph=Gj, candidate_supergraph=Gi):
+                if ni > nj or ei > ej or i > j:
+                    remove_flags[i] = True
+                    break
+
+    return [entry for idx, entry in enumerate(graph_entries) if not remove_flags[idx]]
+
+
 
 # ============================================================
 # 8) 合并训练集
@@ -690,6 +739,8 @@ def main(cfg: DictConfig):
     current_train_pt = init_copy_path
     resume_ckpt = None
     all_discovered_negative_edges = set()
+    all_valid_graph_entries = []
+    all_valid_graph_sigs = set()
     for round_id in range(outer_rounds):
         print("\n" + "=" * 100)
         print(f"[Round {round_id}] current_train_pt = {current_train_pt}")
@@ -733,7 +784,29 @@ def main(cfg: DictConfig):
             # denominator_mode=rule_denominator_mode,
             enable_node_match=enable_node_match,
         )
-        all_discovered_negative_edges.update(tuple(edge) for edge in matched_negative_edges)
+        for idx, data in enumerate(kept):
+            sig = graph_signature(data)
+            if sig in all_valid_graph_sigs:
+                continue
+            all_valid_graph_sigs.add(sig)
+            all_valid_graph_entries.append({
+                "data": data,
+                "nx_g": pyg_to_nx_for_rule_check(data),
+                "metrics": metrics_log[idx],
+            })
+
+        pruned_graph_entries = prune_graph_entries_by_containment(all_valid_graph_entries)
+        all_discovered_negative_edges = set()
+        for entry in pruned_graph_entries:
+            all_discovered_negative_edges.update(
+                tuple(edge) for edge in entry["metrics"]["matched_negative_edges"]
+            )
+
+        print(
+            f"[Round {round_id}] global valid subgraphs={len(all_valid_graph_entries)}, "
+            f"after containment prune={len(pruned_graph_entries)}, "
+            f"negative_edges={len(all_discovered_negative_edges)}"
+        )
         if save_filtered_generated_txt:
             kept_txt = os.path.join(generated_dir, f"iter_{round_id}_generated_samples_filtered.txt")
             save_generated_graphs_txt(kept, kept_txt)
