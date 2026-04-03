@@ -811,8 +811,6 @@ def select_by_fps(embs, k, seed=42):
 
 import random
 
-import random
-
 def select_random(embs, k, seed=42):
     n = len(embs)
     print("len(embs):", n)
@@ -1030,7 +1028,7 @@ def sanity_check_order(model, graph_list, num_trials=10, device=None):
 # 2. Dataset 类定义
 # ==============================================================================
 
-class PPIGraphDataset(InMemoryDataset):
+class DDAGraphDataset(InMemoryDataset):
     def __init__(
         self,
         root,
@@ -1054,7 +1052,7 @@ class PPIGraphDataset(InMemoryDataset):
 
     @property
     def raw_file_names(self):
-        return ['protein_protein_with_type.csv', 'protein.csv']
+        return ['drug_disease_with_semantic.csv', 'disease.csv','drug.csv']
 
     # @property
     # def processed_file_names(self):
@@ -1063,15 +1061,16 @@ class PPIGraphDataset(InMemoryDataset):
     @property
     def processed_file_names(self):
         if self.stage == 'raw':
-            return [f'ppi_{self.split}_raw.pt']
-        return [f'ppi_{self.split}.pt']
+            return [f'dda_{self.split}_raw.pt']
+        return [f'dda_{self.split}.pt']
 
     def download(self):
         pass 
 
     def process(self):
-        ppi_path = os.path.join(self.root, 'raw', 'protein_protein_with_type.csv')
-        meta_path = os.path.join(self.root, 'raw', 'protein.csv')
+        dda_path = os.path.join(self.root, 'raw', 'drug_disease_with_semantic.csv')
+        drug_path = os.path.join(self.root, 'raw', 'drug.csv')
+        disease_path = os.path.join(self.root, 'raw', 'disease.csv')
         
         # --- A. 加载 Metadata ---
         print(f"Loading metadata from {meta_path}...")
@@ -1096,16 +1095,16 @@ class PPIGraphDataset(InMemoryDataset):
             return
 
                 # --- B. 构建大图 ---
-        print(f"Loading PPI structure from {ppi_path}...")
+        print(f"Loading PPI structure from {dda_path}...")
         bigG = nx.Graph()
         try:
-            df_ppi = pd.read_csv(ppi_path, sep=',' if ',' in open(ppi_path).readline() else '\t')
+            df_ppi = pd.read_csv(dda_path, sep=',' if ',' in open(dda_path).readline() else '\t')
             df_ppi.columns = df_ppi.columns.str.strip()
 
             # 第一遍：只加点、加边，边 label 先占位 0
             for _, row in df_ppi.iterrows():
-                u_bid = str(row.get('BioGRID ID Interactor A', '')).split('.')[0]
-                v_bid = str(row.get('BioGRID ID Interactor B', '')).split('.')[0]
+                u_bid = str(row.get('chemical_index', '')).split('.')[0]
+                v_bid = str(row.get('disease_index', '')).split('.')[0]
                 if not u_bid or not v_bid:
                     continue
 
@@ -1239,11 +1238,11 @@ class PPIGraphDataset(InMemoryDataset):
                     has_neg = True
                     break
 
-            if has_neg:
-                neg_sub_cnt += 1
-                metrics = calculate_subgraph_metrics(G_sub, bigG)
-                if metrics and metrics['supp_shape'] >= MATCH_LIMIT:
-                    high_support_cnt += 1
+            # if has_neg:
+            #     neg_sub_cnt += 1
+            #     metrics = calculate_subgraph_metrics(G_sub, bigG)
+            #     if metrics and metrics['supp_shape'] >= MATCH_LIMIT:
+            #         high_support_cnt += 1
 
             G_sub = nx.convert_node_labels_to_integers(G_sub, label_attribute='orig_symbol')
             nx_subgraphs.append(G_sub)
@@ -1378,22 +1377,22 @@ class PPIGraphDataset(InMemoryDataset):
 # 3. DataModule & Infos (保持基本不变)
 # ==============================================================================
 
-class PPIDataModule(AbstractDataModule):
+class DDADataModule(AbstractDataModule):
     def __init__(self, cfg):
         current_file_path = os.path.realpath(__file__)
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))
-        abs_datadir = os.path.join(project_root, 'data', 'PPI')
+        abs_datadir = os.path.join(project_root, 'data', 'DDA')
         self.datadir = abs_datadir
         print(f"[Info] Absolute Data Directory: {self.datadir}")
 
-        final_path = os.path.join(self.datadir, "processed", "ppi_train.pt")
+        final_path = os.path.join(self.datadir, "processed", "dda_train.pt")
         if not os.path.exists(final_path):
             raise FileNotFoundError(
-                f"Final PPI training set not found: {final_path}\n"
-                f"Please run: python src/preprocess/train_ppi_order_and_pick.py"
+                f"Final DDA training set not found: {final_path}\n"
+                f"Please run: python src/preprocess/train_dda_order_and_pick.py"
             )
 
-        base_dataset = PPIGraphDataset(
+        base_dataset = DDAGraphDataset(
             root=self.datadir,
             split='train',
             stage='final',
@@ -1405,7 +1404,7 @@ class PPIDataModule(AbstractDataModule):
         datasets = {'train': base_dataset, 'val': base_dataset, 'test': base_dataset}
         super().__init__(cfg, datasets)
 
-class PPIDatasetInfos(AbstractDatasetInfos):
+class DDADatasetInfos(AbstractDatasetInfos):
     def __init__(self, datamodule, dataset_config):
         self.datamodule = datamodule
         self.name = 'ppi'

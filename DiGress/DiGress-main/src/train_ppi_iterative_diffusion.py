@@ -31,6 +31,8 @@ from analysis.spectre_utils import SpectreSamplingMetrics
 import pandas as pd
 import numpy as np
 import networkx as nx
+from networkx.algorithms import isomorphism
+
 
 from analysis.ppi_rule_utils import (
     build_updated_edge_file_with_random_negatives,
@@ -463,6 +465,53 @@ def filter_generated_graphs(
     # return kept, metrics_log
     return kept, metrics_log, sorted(matched_negative_edges)
 
+def _is_subgraph_contained(candidate_subgraph, candidate_supergraph):
+    node_match = isomorphism.categorical_node_match("feature_val", None)
+    edge_match = isomorphism.categorical_edge_match("raw_label", None)
+    matcher = isomorphism.GraphMatcher(
+        candidate_supergraph,
+        candidate_subgraph,
+        node_match=node_match,
+        edge_match=edge_match,
+    )
+    return matcher.subgraph_is_isomorphic()
+
+
+def prune_graph_entries_by_containment(graph_entries):
+    """
+    输入 graph_entries: [{"data": Data, "nx_g": nx.Graph, "metrics": dict}, ...]
+    规则：当图 A 包含图 B 时，只保留 B（删除 A）。
+    """
+    n = len(graph_entries)
+    if n <= 1:
+        return graph_entries
+
+    remove_flags = [False] * n
+    sizes = [
+        (entry["nx_g"].number_of_nodes(), entry["nx_g"].number_of_edges())
+        for entry in graph_entries
+    ]
+
+    for i in range(n):
+        if remove_flags[i]:
+            continue
+        ni, ei = sizes[i]
+        Gi = graph_entries[i]["nx_g"]
+        for j in range(n):
+            if i == j or remove_flags[i]:
+                continue
+            nj, ej = sizes[j]
+            if ni < nj or ei < ej:
+                continue
+
+            Gj = graph_entries[j]["nx_g"]
+            if _is_subgraph_contained(candidate_subgraph=Gj, candidate_supergraph=Gi):
+                if ni > nj or ei > ej or i > j:
+                    remove_flags[i] = True
+                    break
+
+    return [entry for idx, entry in enumerate(graph_entries) if not remove_flags[idx]]
+
 
 
 # ============================================================
@@ -689,7 +738,11 @@ def main(cfg: DictConfig):
 
     current_train_pt = init_copy_path
     resume_ckpt = None
-    all_discovered_negative_edges = set()
+    # all_discovered_negative_edges = set()
+    all_valid_graph_entries = []
+    all_valid_graph_sigs = set()
+    import time
+    start_time = time.time()
     for round_id in range(outer_rounds):
         print("\n" + "=" * 100)
         print(f"[Round {round_id}] current_train_pt = {current_train_pt}")
@@ -721,7 +774,7 @@ def main(cfg: DictConfig):
             save_generated_graphs_txt(generated, generated_txt)
             print(f"[Round {round_id}] saved generated txt -> {generated_txt}")
 
-
+        #kept里面是图矩阵
         kept, metrics_log, matched_negative_edges = filter_generated_graphs(
             generated_graphs=generated,
             bigG=bigG,
@@ -733,14 +786,34 @@ def main(cfg: DictConfig):
             # denominator_mode=rule_denominator_mode,
             enable_node_match=enable_node_match,
         )
-        all_discovered_negative_edges.update(tuple(edge) for edge in matched_negative_edges)
+        # all_discovered_negative_edges.update(tuple(edge) for edge in matched_negative_edges)
+
+        round_valid_graph_entries = []
+        for idx, data in enumerate(kept):
+            sig = graph_signature(data)
+            if sig in all_valid_graph_sigs:
+                continue
+            all_valid_graph_sigs.add(sig)
+            entry = {
+                "data": data,
+                "nx_g": pyg_to_nx_for_rule_check(data),
+                "metrics": metrics_log[idx],
+            }
+            round_valid_graph_entries.append(entry)
+
+        all_valid_graph_entries.extend(round_valid_graph_entries)
+
+        print(
+            f"[Round {round_id}] round valid subgraphs={len(round_valid_graph_entries)}, "
+            f"global collected={len(all_valid_graph_entries)}"
+        )
         if save_filtered_generated_txt:
             kept_txt = os.path.join(generated_dir, f"iter_{round_id}_generated_samples_filtered.txt")
             save_generated_graphs_txt(kept, kept_txt)
             print(f"[Round {round_id}] saved filtered generated txt -> {kept_txt}")
 
         #TODO  把子图的压缩编码也解码回去，就对上了？
-        print(len(all_discovered_negative_edges))
+        # print(len(all_discovered_negative_edges))
         metrics_json = os.path.join(metrics_dir, f"iter_{round_id}_metrics.json")
         with open(metrics_json, "w", encoding="utf-8") as f:
             json.dump(metrics_log, f, indent=2)
@@ -765,35 +838,58 @@ def main(cfg: DictConfig):
         current_train_pt = next_train_pt
         resume_ckpt = last_ckpt
 
-        if export_discovered_negative_edges:
-            save_negative_edges_csv(
-                negative_edges=sorted(all_discovered_negative_edges),
-                output_path=discovered_negative_edges_file,
-                src_col=edge_src_col,
-                dst_col=edge_dst_col,
-                rel_col=edge_rel_col,
-                rel_name=edge_rel_name,
-                label_col=edge_label_col,
-                negative_label=edge_negative_label,
-            )
-            print(f"[Done] discovered negative edges saved -> {discovered_negative_edges_file}")
+    end_time = time.time()
+    cost_time = end_time - start_time
+    print(f"===========cost time {cost_time:.4f} ===========")
+    pruned_graph_entries = prune_graph_entries_by_containment(all_valid_graph_entries)
+    final_discovered_negative_edges = set()
+    for entry in pruned_graph_entries:
+        final_discovered_negative_edges.update(
+            tuple(edge) for edge in entry["metrics"]["matched_negative_edges"]
+        )
 
-            if edge_old_file:
-                build_updated_edge_file_with_random_negatives(
-                    edge_old_file=edge_old_file,
-                    discovered_negative_edges=sorted(all_discovered_negative_edges),
-                    output_path=edge_updated_output_file,
-                    src_col=edge_src_col,
-                    dst_col=edge_dst_col,
-                    rel_col=edge_rel_col,
-                    rel_name=edge_rel_name,
-                    label_col=edge_label_col,
-                    negative_label=edge_negative_label,
-                    num_additional_negatives=num_additional_negatives,
-                    random_seed=random_seed,
-                )
-                print(f"[Done] updated edge file saved -> {edge_updated_output_file}")
+    print(
+        f"[Final] collected valid subgraphs={len(all_valid_graph_entries)}, "
+        f"minimal graphs={len(pruned_graph_entries)}, "
+        f"final negative_edges={len(final_discovered_negative_edges)}"
+    )
+    minimal_graphs_txt = os.path.join(generated_dir, "final_minimal_graphs.txt")
+    save_generated_graphs_txt(
+        [entry["data"] for entry in pruned_graph_entries],
+        minimal_graphs_txt
+    )
+    print(f"[Final] minimal graphs txt saved -> {minimal_graphs_txt}")
 
+
+
+    if export_discovered_negative_edges:
+        save_negative_edges_csv(
+            negative_edges=sorted(final_discovered_negative_edges),
+            output_path=discovered_negative_edges_file,
+            src_col=edge_src_col,
+            dst_col=edge_dst_col,
+            rel_col=edge_rel_col,
+            rel_name=edge_rel_name,
+            label_col=edge_label_col,
+            negative_label=edge_negative_label,
+        )
+        print(f"[Done] discovered negative edges saved -> {discovered_negative_edges_file}")
+
+    if edge_old_file:
+        build_updated_edge_file_with_random_negatives(
+            edge_old_file=edge_old_file,
+            discovered_negative_edges=sorted(final_discovered_negative_edges),
+            output_path=edge_updated_output_file,
+            src_col=edge_src_col,
+            dst_col=edge_dst_col,
+            rel_col=edge_rel_col,
+            rel_name=edge_rel_name,
+            label_col=edge_label_col,
+            negative_label=edge_negative_label,
+            num_additional_negatives=num_additional_negatives,
+            random_seed=random_seed,
+        )
+        print(f"[Done] updated edge file saved -> {edge_updated_output_file}")
 
     print("[Done] iterative diffusion training finished.")
 

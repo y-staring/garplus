@@ -243,6 +243,88 @@ def main(cfg: DictConfig):
             'extra_features': extra_features,
             'domain_features': domain_features
         }
+    elif dataset_config["name"] == 'dda':
+        # ---------------------------------------------------------
+        # ★★★ DDA Dataset Configuration for GAR+ ★★★
+        # ---------------------------------------------------------
+        # from datasets.ppi_dataset import PPIDataModule, PPIDatasetInfos  # 修正导入名称
+        from datasets.dda_dataset_order_embedding import DDADataModule, DDADatasetInfos  # 修正导入名称
+        from analysis.visualization import NonMolecularVisualization
+        from metrics.abstract_metrics import TrainAbstractMetricsDiscrete, TrainAbstractMetrics
+        from analysis.spectre_utils import SpectreSamplingMetrics
+
+        # 1. 初始化 DataModule
+        # 所有路径和采样参数逻辑都在 PPIDataModule.__init__ 内部处理
+        datamodule = DDADataModule(cfg)
+
+        #========================================
+        from collections import Counter
+        import torch
+
+        def count_bitmasks(dataloader, max_batches=None):
+            cnt = Counter()
+            for bi, data in enumerate(dataloader):
+                if hasattr(data, "edge_label_mask"):
+                    masks = data.edge_label_mask.detach().cpu().tolist()
+                    cnt.update(masks)
+                else:
+                    raise ValueError("Batch里没有 edge_label_mask；你需要在Dataset里保留它。")
+
+                if max_batches is not None and (bi + 1) >= max_batches:
+                    break
+
+            print("\n==== Bitmask stats ====")
+            print("不同 bitmask（谓词组合）数量 =", len(cnt))
+            print("总边数 =", sum(cnt.values()))
+            print("最常见的 10 种 bitmask =", cnt.most_common(10))
+            return cnt
+
+        train_loader = datamodule.train_dataloader()
+
+        cnt = count_bitmasks(train_loader) 
+        # ===================================================
+        # 2. 初始化 Dataset Infos (负责统计节点类型分布、边类型分布等)
+        dataset_infos = DDADatasetInfos(datamodule, dataset_config)
+
+        # 3. 训练指标 (根据模型类型选择)
+        train_metrics = TrainAbstractMetricsDiscrete() if cfg.model.type == 'discrete' else TrainAbstractMetrics()
+        visualization_tools = NonMolecularVisualization()
+
+        # 4. 额外特征 (Extra Features)
+        # 对于 PPI 无向图，Cycles 和 Eigenvalues 是捕捉功能模块的关键
+        if cfg.model.type == 'discrete' and cfg.model.extra_features is not None:
+            extra_features = ExtraFeatures(cfg.model.extra_features, dataset_info=dataset_infos)
+        else:
+            extra_features = DummyExtraFeatures()
+        
+        # PPI 是非分子图，不需要 Domain Specific Features (如原子价态)
+        domain_features = DummyExtraFeatures()
+
+        # 5. 计算输入输出维度 (GAR+ 编码维度 + Extra Features 维度)
+        dataset_infos.compute_input_output_dims(
+            datamodule=datamodule,
+            extra_features=extra_features,
+            domain_features=domain_features
+        )
+
+        # 6. 采样指标 (Sampling Metrics)
+        # SpectreSamplingMetrics 计算 Degree/Clustering/Orbit 等分布距离
+        # compute_emd=True 会稍微慢一点但更准确，metrics_list 根据需要调整
+        #validty：没有太多边也没有太少边的比例（连通性和平面性）
+        sampling_metrics = SpectreSamplingMetrics(
+            datamodule, 
+            compute_emd=True, 
+            metrics_list=['degree', 'clustering', 'orbit'] 
+        )
+
+        model_kwargs = {
+            'dataset_infos': dataset_infos,
+            'train_metrics': train_metrics,
+            'sampling_metrics': sampling_metrics,
+            'visualization_tools': visualization_tools,
+            'extra_features': extra_features,
+            'domain_features': domain_features
+        }
         
     elif dataset_config["name"] in ['qm9', 'guacamol', 'moses']:
         from metrics.molecular_metrics import TrainMolecularMetrics, SamplingMolecularMetrics

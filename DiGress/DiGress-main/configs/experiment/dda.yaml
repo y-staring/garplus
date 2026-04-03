@@ -1,0 +1,51 @@
+# @package _global_
+
+general:
+  name : 'dda_gar'               # 实验名称
+  gpus : 1
+  wandb: 'disabled'              # 调试时设为 disabled，跑通后可改为 'online'
+  resume: null
+  test_only: null
+  
+  # === 验证与采样频率 ===
+  check_val_every_n_epochs: 500   # 每 50 个 epoch 验证一次
+  sample_every_val: 10           # 每 10 次验证采样一次 (即每 500 epochs)
+  samples_to_generate: 20        # 验证时生成的图数量
+  samples_to_save: 20            # 保存到硬盘的数量
+  chains_to_save: 1              # 保存生成过程 GIF 的数量
+  log_every_steps: 50
+  number_chain_steps: 50
+  
+  # === 最终模型采样 ===
+  final_model_samples_to_generate: 100
+  final_model_samples_to_save: 50
+  final_model_chains_to_save: 5
+
+train:
+  n_epochs: 1500                 # PPI 数据集通常比 SBM 难，需要多练一会
+  batch_size: 32                 # 根据显存调整，PPI 子图如果较大 (N=50)，32 是安全值
+  save_model: True
+  optimizer:
+    lr: 2e-4                     # 默认学习率
+
+model:
+  n_layers: 4
+  
+  # ★★★ 关键修改 1: Loss 权重 [Node_Weight, Edge_Weight] ★★★
+  # 你的参考配置是 [5, 0]，这意味着完全不学习边 (Edge Loss = 0)！这对于 PPI 是致命的。
+  # PPI GAR+ 的核心逻辑全在边上 (Positive/Negative/ML)，所以必须给边很高的权重。
+  # 建议设为 [1, 2] 或 [1, 5]，让模型重点关注边的分类准确性。
+  lambda_train: [1, 2] 
+
+  # ★★★ 关键修改 2: 辅助特征 ★★★
+  # PPI 网络高度依赖 "环 (Cycles)" 和 "谱 (Spectral)" 特征来识别功能模块
+  extra_features: 'all'          # 开启所有辅助特征 (Cycles, Eigenvalues)
+
+  # ★★★ 关键修改 3: 噪声调度 ★★★
+  # 针对稀疏图 (PPI)，Cosine Schedule 能更好保持稀疏性 
+  diffusion_noise_schedule: 'cosine'
+  diffusion_steps: 500
+  
+  # 隐藏层维度 (根据 N=50 的图大小适当增加)
+  hidden_mlp_dims: { 'X': 256, 'E': 128, 'y': 256 }
+  hidden_dims: { 'dx': 256, 'de': 64, 'dy': 128, 'n_head': 8, 'dim_ffX': 256, 'dim_ffE': 128, 'dim_ffy': 256 }

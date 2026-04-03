@@ -772,7 +772,8 @@ if __name__ == "__main__":
     # 不使用命令行参数；直接在这里改配置即可运行
     config = PipelineConfig(
         # generated_sample_file="/home/yyyy/codework/GARplus/DiGress/outputs/2026-03-25/21-57-41-ppi_gar/generated_samples1.txt",
-        generated_sample_file="/home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp01/generated/iter_1_generated_samples_filtered.txt",
+        # generated_sample_file="/home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp01/generated/iter_1_generated_samples_filtered.txt",
+        generated_sample_file="/home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp03/generated/final_minimal_graphs.txt",
         reference_source="raw_csv_graph",  #
         raw_edge_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein_protein_with_type.csv",
         raw_node_file="/home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/raw/protein.csv",

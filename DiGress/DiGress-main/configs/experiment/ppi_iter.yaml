@@ -56,11 +56,11 @@ model:
 paths:
   source_datadir: /home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI
   source_train_pt: /home/yyyy/codework/GARplus/DiGress/DiGress-main/data/PPI/processed/ppi_train.pt
-  run_root: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02
+  run_root: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp03
 
 iterative:
-  outer_rounds: 2
-  epochs_per_round: 50
+  outer_rounds: 5
+  epochs_per_round: 100
   generate_per_round: 200
   max_new_per_round: 100
   sample_batch_size: 32
@@ -74,8 +74,8 @@ iterative:
   ml_threshold: 0.3
 
   # rule filter thresholds
-  confidence_threshold: 0.9
-  support_threshold: 10
+  confidence_threshold: 0.5
+  support_threshold: 50
   rule_match_limit: 400
   rule_time_limit: 5
   enable_node_match: true
@@ -87,11 +87,11 @@ iterative:
 
   # save discovered real negative edges (from matched real_label) for downstream update
   export_discovered_negative_edges: true
-  discovered_negative_edges_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02/metrics/discovered_negative_edges.csv
+  discovered_negative_edges_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp03/metrics/discovered_negative_edges.csv
 
   # if set, build: edge_old + discovered negatives + random negatives
   edge_old_file: ""
-  edge_updated_output_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp02/metrics/edge_random_new.csv
+  edge_updated_output_file: /home/yyyy/codework/GARplus/DiGress/iteration_outputs/ppi/ppi_iter_exp03/metrics/edge_random_new.csv
   edge_src_col: src
   edge_dst_col: dst
   edge_rel_col: rel
