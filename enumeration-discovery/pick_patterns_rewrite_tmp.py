@@ -1,6 +1,5 @@
-﻿import os
+import os
 import random
-import sys
 from typing import List
 
 import networkx as nx
@@ -8,13 +7,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Batch, Data, InMemoryDataset
-from tqdm import tqdm
-
-CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-DIGRESS_ROOT = os.path.join(PROJECT_ROOT, "DiGress", "DiGress-main")
-if DIGRESS_ROOT not in sys.path:
-    sys.path.insert(0, DIGRESS_ROOT)
 
 from sampling_utils import (
     GraphOrderEncoder,
@@ -34,7 +26,7 @@ RETRAIN_ENCODER = True
 RECOMPUTE_EMBEDDINGS = True
 RUN_SANITY_CHECK = True
 
-RAW_NUM_SUBGRAPHS = 500
+RAW_NUM_SUBGRAPHS = 4000
 K_HOP = 2
 RAW_MIN_NODES = 5
 RAW_MAX_NODES = 10
@@ -48,20 +40,29 @@ EMB_DIM = 64
 NUM_LAYERS = 3
 BATCH_SIZE = 32
 LR = 1e-3
-EPOCHS = 5
+EPOCHS = 15
 MARGIN = 1.0
 
 SELECTOR = "fps"
-TARGET_NUM = 200
+TARGET_NUM = 2000
 
-DEFAULT_EDGE_CSV = os.path.join(CURRENT_DIR, "data", "protein_protein.csv")
-DEFAULT_NODE_CSV = os.path.join(CURRENT_DIR, "data", "node.csv")
+CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+#TODO: change to your own path
+DEFAULT_EDGE_CSV = os.path.join(
+    PROJECT_ROOT, "GNN", "code", "PPI_test", "data", "data_signed", "edges.csv"
+)
+DEFAULT_NODE_CSV = os.path.join(
+    PROJECT_ROOT, "GNN", "code", "PPI_test", "data", "data_signed", "node.csv"
+)
 PROCESSED_DIR = os.path.join(CURRENT_DIR, "processed", "ppi")
 
 ENCODER_FILENAME = "ppi_order_encoder.pt"
 EMB_FILENAME = "ppi_train_embeddings.pt"
-RAW_FILENAME = "ppi_raw.pt"
-SELECTED_FILENAME = "ppi_selected.pt"
+RAW_FILENAME = "ppi_train_raw.pt"
+TRAIN_FILENAME = "ppi_train.pt"
+VAL_FILENAME = "ppi_val.pt"
+TEST_FILENAME = "ppi_test.pt"
 
 
 class PickPatternPPIDataset(InMemoryDataset):
@@ -70,6 +71,8 @@ class PickPatternPPIDataset(InMemoryDataset):
         root,
         edge_csv,
         node_csv=None,
+        split="train",
+        stage="final",
         num_subgraphs=2000,
         min_nodes=5,
         max_nodes=10,
@@ -77,14 +80,24 @@ class PickPatternPPIDataset(InMemoryDataset):
     ):
         self.edge_csv = edge_csv
         self.node_csv = node_csv
+        self.split = split
+        self.stage = stage
         self.num_subgraphs = num_subgraphs
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
         self.k_hop = k_hop
         super().__init__(root)
 
-        load_path = self.processed_paths[0]
-        print(f"[Load] path={load_path}")
+        if self.stage == "raw":
+            load_path = self.processed_paths[0]
+        else:
+            #不需要再区分
+            split_to_idx = {"train": 0, "val": 1, "test": 2}
+            if self.split not in split_to_idx:
+                raise ValueError(f"Unknown split: {self.split}")
+            load_path = self.processed_paths[split_to_idx[self.split]]
+
+        print(f"[Load] stage={self.stage}, split={self.split}, path={load_path}")
         self.data, self.slices = torch.load(load_path)
 
     @property
@@ -93,12 +106,18 @@ class PickPatternPPIDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return [RAW_FILENAME]
+        if self.stage == "raw":
+            return [RAW_FILENAME]
+        return [TRAIN_FILENAME, VAL_FILENAME, TEST_FILENAME]
 
     def download(self):
         return
 
     def process(self):
+        if self.stage != "raw":
+            print("[Info] stage='final' does not auto-generate final splits here.")
+            return
+
         graph = build_ppi_graph(self.edge_csv, self.node_csv)
         data_list = sample_k_hop_subgraphs(
             graph=graph,
@@ -122,17 +141,13 @@ def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
     df_edges = pd.read_csv(edge_csv)
     df_edges.columns = [str(c).strip().lower() for c in df_edges.columns]
 
-    if "index_a" in df_edges.columns and "index_b" in df_edges.columns:
-        src_col, dst_col = "index_a", "index_b"
-    elif "x_index" in df_edges.columns and "y_index" in df_edges.columns:
-        src_col, dst_col = "x_index", "y_index"
-    else:
-        src_col, dst_col = "src", "dst"
+    src_col = "index_a" if "index_a" in df_edges.columns else "src"
+    dst_col = "index_b" if "index_a" in df_edges.columns else "dst"
     rel_col = "rel" if "rel" in df_edges.columns else None
 
     if src_col not in df_edges.columns or dst_col not in df_edges.columns:
         raise ValueError(
-            f"Expected src/dst, x_index/y_index, or index_A/index_B columns in {edge_csv}, got {list(df_edges.columns)}"
+            f"Expected src/dst or indexa/indexb columns in {edge_csv}, got {list(df_edges.columns)}"
         )
 
     if rel_col is not None:
@@ -140,32 +155,18 @@ def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
         df_edges = df_edges[rel_series.isin(["protein_protein", "protein-protein"])].copy()
 
     graph = nx.Graph()
-    valid_protein_nodes = None
     if node_csv and os.path.exists(node_csv):
         df_nodes = pd.read_csv(node_csv)
         df_nodes.columns = [str(c).strip().lower() for c in df_nodes.columns]
-        if "node_type" in df_nodes.columns:
-            df_nodes = df_nodes[df_nodes["node_type"].astype(str).str.lower() == "protein"].copy()
-        if "node_index" in df_nodes.columns:
-            node_id_col = "node_index"
-        elif "node_id" in df_nodes.columns:
-            node_id_col = "node_id"
-        else:
-            node_id_col = df_nodes.columns[0]
-        valid_protein_nodes = set(int(node_id) for node_id in df_nodes[node_id_col].tolist())
-        for node_id in valid_protein_nodes:
-            graph.add_node(node_id)
-        print(f"[Graph] Protein-only node filter enabled: {len(valid_protein_nodes)} protein nodes")
+        node_id_col = "node_id" if "node_id" in df_nodes.columns else df_nodes.columns[0]
+        for node_id in df_nodes[node_id_col].tolist():
+            graph.add_node(int(node_id))
 
     for _, row in df_edges.iterrows():
         src = int(row[src_col])
         dst = int(row[dst_col])
-        if src == dst:
-            continue
-        if valid_protein_nodes is not None:
-            if src not in valid_protein_nodes or dst not in valid_protein_nodes:
-                continue
-        graph.add_edge(src, dst)
+        if src != dst:
+            graph.add_edge(src, dst)
 
     print(
         f"[Graph] Built PPI graph from protein-protein edges: "
@@ -182,6 +183,7 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int) -> Data:
     clustering = np.array(
         [nx.clustering(subgraph, node_id) for node_id in node_list], dtype=np.float32
     )
+    #是否中心节点
     center_flag = np.array(
         [1.0 if node_id == center_node else 0.0 for node_id in node_list], dtype=np.float32
     )
@@ -210,8 +212,6 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int) -> Data:
         y=torch.zeros(1, 0).float(),
     )
     data.center_id = torch.tensor([node_to_idx[center_node]], dtype=torch.long)
-    data.orig_node_ids = torch.tensor(node_list, dtype=torch.long)
-    data.center_orig_id = torch.tensor([center_node], dtype=torch.long)
     return data
 
 
@@ -235,16 +235,9 @@ def sample_k_hop_subgraphs(
         f"[Sample] Extracting up to {num_subgraphs} subgraphs with "
         f"{k_hop}-hop neighborhoods and size in [{min_nodes}, {max_nodes}]"
     )
-    pbar = tqdm(total=num_subgraphs, desc="Sampling subgraphs", unit="subgraph")
 
     while len(subgraphs) < num_subgraphs and attempts < max_attempts:
         attempts += 1
-        if attempts % 1000 == 0:
-            pbar.set_postfix(
-                attempts=attempts,
-                unique=len(subgraphs),
-                coverage=f"{len(subgraphs)}/{num_subgraphs}",
-            )
         center = random.choice(nodes)
         ego = nx.ego_graph(graph, center, radius=k_hop, undirected=True)
 
@@ -267,15 +260,38 @@ def sample_k_hop_subgraphs(
             continue
         seen_signatures.add(signature)
         subgraphs.append(graph_to_pyg(ego, center_node=center))
-        pbar.update(1)
 
-    pbar.close()
     print(f"[Sample] Collected {len(subgraphs)} unique subgraphs after {attempts} attempts")
     return subgraphs
 
 
 def load_data_list_from_inmemory(dataset):
     return [dataset.get(i) for i in range(len(dataset))]
+
+
+def split_graphs(graph_list, seed=42):
+    num_graphs = len(graph_list)
+    test_len = int(round(num_graphs * 0.2))
+    train_len = int(round((num_graphs - test_len) * 0.8))
+    val_len = num_graphs - train_len - test_len
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(num_graphs)
+    rng.shuffle(indices)
+
+    train_idx = indices[:train_len]
+    val_idx = indices[train_len : train_len + val_len]
+    test_idx = indices[train_len + val_len :]
+
+    train_graphs = [graph_list[i] for i in train_idx]
+    val_graphs = [graph_list[i] for i in val_idx]
+    test_graphs = [graph_list[i] for i in test_idx]
+
+    print(f"[Split] Total: {num_graphs}")
+    print(f"[Split] Train: {len(train_graphs)}")
+    print(f"[Split] Val:   {len(val_graphs)}")
+    print(f"[Split] Test:  {len(test_graphs)}")
+    return train_graphs, val_graphs, test_graphs
 
 
 @torch.no_grad()
@@ -334,12 +350,16 @@ def main():
 
     encoder_path = os.path.join(PROCESSED_DIR, ENCODER_FILENAME)
     emb_path = os.path.join(PROCESSED_DIR, EMB_FILENAME)
-    selected_path = os.path.join(PROCESSED_DIR, SELECTED_FILENAME)
+    train_path = os.path.join(PROCESSED_DIR, TRAIN_FILENAME)
+    val_path = os.path.join(PROCESSED_DIR, VAL_FILENAME)
+    test_path = os.path.join(PROCESSED_DIR, TEST_FILENAME)
 
     raw_dataset = PickPatternPPIDataset(
         root=PROCESSED_DIR,
         edge_csv=DEFAULT_EDGE_CSV,
         node_csv=DEFAULT_NODE_CSV,
+        split="train",
+        stage="raw",
         num_subgraphs=RAW_NUM_SUBGRAPHS,
         min_nodes=RAW_MIN_NODES,
         max_nodes=RAW_MAX_NODES,
@@ -432,11 +452,19 @@ def main():
     )
     print(f"[Info] Saved embeddings to: {emb_path}")
 
-    selected_data, selected_slices = raw_dataset.collate(selected_graphs)
-    torch.save((selected_data, selected_slices), selected_path)
-    print(f"[Done] Saved selected dataset -> {selected_path}")
+    train_graphs, val_graphs, test_graphs = split_graphs(selected_graphs, seed=seed)
+    train_data, train_slices = raw_dataset.collate(train_graphs)
+    val_data, val_slices = raw_dataset.collate(val_graphs)
+    test_data, test_slices = raw_dataset.collate(test_graphs)
+
+    torch.save((train_data, train_slices), train_path)
+    torch.save((val_data, val_slices), val_path)
+    torch.save((test_data, test_slices), test_path)
+
+    print(f"[Done] Saved train dataset -> {train_path}")
+    print(f"[Done] Saved val dataset   -> {val_path}")
+    print(f"[Done] Saved test dataset  -> {test_path}")
 
 
 if __name__ == "__main__":
     main()
-

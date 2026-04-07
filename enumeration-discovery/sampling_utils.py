@@ -21,7 +21,6 @@ from torch_geometric.nn import GINConv, global_mean_pool
 
 from networkx.algorithms.isomorphism import GraphMatcher
 
-from src.datasets.abstract_dataset import AbstractDataModule, AbstractDatasetInfos
 
 
 # ==============================================================================
