@@ -126,6 +126,26 @@ def induced_subgraph_by_node_drop(data, keep_ratio=0.7, min_nodes=3):
         y=torch.zeros(1, 0).float()
     )
 
+    if hasattr(data, "orig_node_ids") and data.orig_node_ids is not None:
+        new_data.orig_node_ids = data.orig_node_ids[keep_nodes]
+
+    if hasattr(data, "center_id") and data.center_id is not None:
+        old_center = int(data.center_id.view(-1)[0].item())
+        if old_center in keep_set:
+            new_center = old_to_new[old_center]
+        else:
+            # Keep batching stable even when the original center node is dropped.
+            new_center = 0
+        new_data.center_id = torch.tensor([new_center], dtype=torch.long)
+
+    if hasattr(data, "center_orig_id") and data.center_orig_id is not None:
+        if hasattr(new_data, "orig_node_ids") and new_data.orig_node_ids.numel() > 0:
+            center_idx = int(new_data.center_id.view(-1)[0].item()) if hasattr(new_data, "center_id") else 0
+            new_center_orig = int(new_data.orig_node_ids[center_idx].item())
+        else:
+            new_center_orig = int(data.center_orig_id.view(-1)[0].item())
+        new_data.center_orig_id = torch.tensor([new_center_orig], dtype=torch.long)
+
     if hasattr(data, "edge_attr") and data.edge_attr is not None:
         new_data.edge_attr = data.edge_attr[kept_eids]
 

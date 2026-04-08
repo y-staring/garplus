@@ -285,6 +285,7 @@ def sanity_check_order(model, graph_list, num_trials=10):
         return
 
     model.eval()
+    device = next(model.parameters()).device
     total = 0
     ok = 0
     sample_count = min(num_trials, len(graph_list))
@@ -314,8 +315,8 @@ def sanity_check_order(model, graph_list, num_trials=10):
             num_nodes=len(keep_nodes),
         )
 
-        z_small = model(Batch.from_data_list([small]))
-        z_large = model(Batch.from_data_list([graph]))
+        z_small = model(Batch.from_data_list([small]).to(device))
+        z_large = model(Batch.from_data_list([graph]).to(device))
         e_small_large = float(order_energy(z_small, z_large).item())
         e_large_small = float(order_energy(z_large, z_small).item())
         print(
