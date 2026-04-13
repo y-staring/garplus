@@ -30,8 +30,8 @@ OUTPUT_JSON = DEFAULT_OUTPUT_JSON
 MATCH_GRAPH_INDEX = None
 MATCH_START_INDEX = 0
 MATCH_END_INDEX = None
-MAX_MATCHES = None
-TIMEOUT_SECONDS = None
+MAX_MATCHES = 100
+TIMEOUT_SECONDS = 60
 
 # Matching standard:
 # "topology_only" means both big graph and small graph are treated as unlabeled protein-protein graphs.
