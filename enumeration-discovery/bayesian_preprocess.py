@@ -42,8 +42,10 @@ def find_first_existing(df, candidates):
 
 
 def find_id_column_protein(df):
-    # Prefer biogrid_id; fallback to index.
-    return find_first_existing(df, ["biogrid_id", "index"])
+    # For the current PPI workflow, always prefer the local graph index first.
+    # This keeps protein.csv aligned with interaction files that use
+    # index_A/index_B.
+    return find_first_existing(df, ["index", "biogrid_id"])
 
 
 def find_interactor_columns(df):
@@ -462,35 +464,28 @@ def build_pairwise_rows(edge_map, negative_edges, protein_map):
     return rows
 
 
-def main():
-    # argparse is included as requested, but this script does not rely on
-    # command-line parameters. Edit the file-level path constants instead.
-    parser = argparse.ArgumentParser(description="Build pair-wise protein table.")
-    parser.parse_args([])
-
+def build_pairwise_table(protein_csv, interaction_csv, output_csv, neg_ratio=1.0):
+    # ------------------------------------------------------------------
+    # Reusable pipeline entry:
+    #   protein.csv + one interaction.csv
+    #   -> one pair-wise predicate table CSV
+    #
+    # This is used both by the script main() and by batch pattern runners.
+    # ------------------------------------------------------------------
     random.seed(SEED)
     np.random.seed(SEED)
 
-    base_dir = Path(__file__).resolve().parent
-    print(base_dir)
-    protein_path = PROTEIN_CSV
-    interaction_path = INTERACTION_CSV
-    output_path = base_dir / OUTPUT_CSV
+    protein_df = pd.read_csv(protein_csv, low_memory=False)
+    interaction_df = pd.read_csv(interaction_csv, low_memory=False)
 
-    protein_df = pd.read_csv(protein_path, low_memory=False)
-    interaction_df = pd.read_csv(interaction_path, low_memory=False)
-
-    # Build node-level feature map from protein.csv
     protein_map = build_protein_feature_map(protein_df)
     protein_node_ids = sorted(protein_map.keys())
 
-    # Build positive interaction edges from interaction.csv
     edge_map = build_positive_edges(interaction_df)
     positive_edge_set = set(edge_map.keys())
     num_positive = len(positive_edge_set)
 
-    # Sample the same number of negative edges by default
-    num_negative = int(round(num_positive * NEG_RATIO))
+    num_negative = int(round(num_positive * neg_ratio))
     negative_edges = sample_negative_edges(
         node_ids=protein_node_ids,
         positive_edge_set=positive_edge_set,
@@ -498,11 +493,9 @@ def main():
         seed=SEED,
     )
 
-    # Construct the final pair-wise predicate table
     rows = build_pairwise_rows(edge_map, negative_edges, protein_map)
     out_df = pd.DataFrame(rows)
 
-    # Force all predicate/label columns to be integer 0/1
     predicate_cols = [
         "label",
         "both_reviewed",
@@ -523,15 +516,43 @@ def main():
     for col in predicate_cols:
         out_df[col] = out_df[col].fillna(0).astype(int)
 
-    # Write the final table to CSV
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
     out_df = out_df.sort_values(["protein_a", "protein_b"]).reset_index(drop=True)
-    out_df.to_csv(output_path, index=False)
+    out_df.to_csv(output_csv, index=False)
 
-    # Final summary printed to terminal
-    print(f"Protein nodes: {len(protein_node_ids)}")
-    print(f"Positive edges: {num_positive}")
-    print(f"Negative edges: {len(negative_edges)}")
-    print(f"Output rows: {len(out_df)}")
+    summary = {
+        "protein_nodes": len(protein_node_ids),
+        "positive_edges": num_positive,
+        "negative_edges": len(negative_edges),
+        "output_rows": len(out_df),
+        "output_csv": str(output_csv),
+    }
+    return out_df, summary
+
+
+def main():
+    # argparse is included as requested, but this script does not rely on
+    # command-line parameters. Edit the file-level path constants instead.
+    parser = argparse.ArgumentParser(description="Build pair-wise protein table.")
+    parser.parse_args([])
+
+    base_dir = Path(__file__).resolve().parent
+    print(base_dir)
+    protein_path = PROTEIN_CSV
+    interaction_path = INTERACTION_CSV
+    output_path = base_dir / OUTPUT_CSV
+    _, summary = build_pairwise_table(
+        protein_csv=protein_path,
+        interaction_csv=interaction_path,
+        output_csv=output_path,
+        neg_ratio=NEG_RATIO,
+    )
+
+    print(f"Protein nodes: {summary['protein_nodes']}")
+    print(f"Positive edges: {summary['positive_edges']}")
+    print(f"Negative edges: {summary['negative_edges']}")
+    print(f"Output rows: {summary['output_rows']}")
 
 
 if __name__ == "__main__":

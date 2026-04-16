@@ -10,7 +10,7 @@ from pgmpy.estimators import HillClimbSearch
 
 
 PAIRWISE_CSV = "processed/ppi/processed/predicate_pairwise_table.csv"
-OUTPUT_DIR = "bn_output"
+OUTPUT_DIR = "processed/ppi/bn_output"
 SCORING_METHOD = "k2score"
 MAX_ITER = int(1e4)
 MAX_INDEGREE = None
@@ -204,7 +204,7 @@ def visualize_structure(model, output_dir):
     print(f"[Saved] {png_path}")
 
 
-def partition(pairwise_path):
+def partition(pairwise_path, output_dir=None):
     """
     Full pipeline:
     1. Prepare BN input data
@@ -229,7 +229,7 @@ def partition(pairwise_path):
     summary["elapsed_seconds"] = elapsed
     print_structure_summary(summary)
 
-    output_dir = Path(__file__).resolve().parent / OUTPUT_DIR
+    output_dir = Path(output_dir) if output_dir is not None else Path(__file__).resolve().parent / OUTPUT_DIR
     save_structure_summary(summary, output_dir)
     visualize_structure(model, output_dir)
     return model, summary

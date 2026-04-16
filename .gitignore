@@ -7,6 +7,7 @@ checkpoints/
 *.ckpt
 *.npy
 *.zip
+*.csv
 *.npz
 logs/
 wandb/
