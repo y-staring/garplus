@@ -1,38 +1,45 @@
 import argparse
-import random
 import re
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 
-SEED = 42
-
-# Edit these paths directly if needed.
-# protein.csv: protein node table
-# interaction.csv: interaction edge table
-# pairwise_table.csv: final pair-wise predicate table
 PROTEIN_CSV = "/home/yyyy/codework/GARplus/GNN/code/DDA_test/data/去病图数据/protein.csv"
 INTERACTION_CSV = "/home/yyyy/codework/GARplus/GNN/code/DDA_test/data/去病图数据/protein_protein.csv"
 OUTPUT_CSV = "predicate_pairwise_table.csv"
 
-# Number of sampled negative edges = NEG_RATIO * number of positive edges.
-NEG_RATIO = 1.0
+OUTPUT_COLUMNS = [
+    "protein_x",
+    "protein_y",
+    "x_high_evidence",
+    "y_high_evidence",
+    "x_long_protein",
+    "y_long_protein",
+    "x_has_coiled_coil",
+    "y_has_coiled_coil",
+    "x_membrane_related",
+    "y_membrane_related",
+    "x_nucleus_related",
+    "y_nucleus_related",
+    "x_secreted_related",
+    "y_secreted_related",
+    "same_location",
+    "same_pathway",
+    "domain_match",
+    "family_match",
+]
 
 
 def normalize_colname(name):
-    # Normalize raw column names so we can match columns more robustly.
     return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
 
 
 def build_column_map(df):
-    # Build a normalized-name -> raw-name lookup table.
     return {normalize_colname(col): col for col in df.columns}
 
 
 def find_first_existing(df, candidates):
-    # Return the first matching raw column name from a list of candidates.
     colmap = build_column_map(df)
     for cand in candidates:
         key = normalize_colname(cand)
@@ -41,56 +48,42 @@ def find_first_existing(df, candidates):
     return None
 
 
+def require_columns(df, candidates, label):
+    col = find_first_existing(df, candidates)
+    if col is None:
+        raise ValueError(
+            f"Required column for '{label}' is missing. "
+            f"Checked aliases={candidates}. Please verify the attribute name in the CSV."
+        )
+    return col
+
+
+def find_optional_column(df, candidates):
+    return find_first_existing(df, candidates)
+
+
+def require_any_column(df, candidate_groups, label):
+    for candidates in candidate_groups:
+        col = find_first_existing(df, candidates)
+        if col is not None:
+            return col
+    raise ValueError(
+        f"Required column group for '{label}' is missing. "
+        f"Checked aliases={candidate_groups}. Please verify the attribute name in the CSV."
+    )
+
+
 def find_id_column_protein(df):
-    # For the current PPI workflow, always prefer the local graph index first.
-    # This keeps protein.csv aligned with interaction files that use
-    # index_A/index_B.
-    return find_first_existing(df, ["index", "biogrid_id"])
+    return require_columns(df, ["index"], "protein index")
 
 
 def find_interactor_columns(df):
-    # Try to identify the A/B endpoint columns in the interaction table.
-    a_candidates = [
-        "index_A",
-        "BioGRID ID Interactor A",
-        "biogrid_id_interactor_a",
-        "interactor_a",
-        "protein_a",
-        "proteina",
-        "a",
-        "src",
-        "source",
-    ]
-    b_candidates = [
-        "index_B",
-        "BioGRID ID Interactor B",
-        "biogrid_id_interactor_b",
-        "interactor_b",
-        "protein_b",
-        "proteinb",
-        "b",
-        "dst",
-        "target",
-    ]
-
-    a_col = find_first_existing(df, a_candidates)
-    b_col = find_first_existing(df, b_candidates)
-
-    if a_col and b_col:
-        return a_col, b_col
-
-    colmap = build_column_map(df)
-    for norm_name, raw_name in colmap.items():
-        if a_col is None and ("interactora" in norm_name or norm_name.endswith("a")):
-            a_col = raw_name
-        if b_col is None and ("interactorb" in norm_name or norm_name.endswith("b")):
-            b_col = raw_name
-
+    a_col = require_columns(df, ["index_A"], "interaction index_A")
+    b_col = require_columns(df, ["index_B"], "interaction index_B")
     return a_col, b_col
 
 
 def is_missing(value):
-    # Robust missing-value check for dirty CSV content.
     if value is None:
         return True
     if pd.isna(value):
@@ -99,16 +92,7 @@ def is_missing(value):
     return s == "" or s.lower() in {"nan", "none", "null", "-", "--", "na", "n/a"}
 
 
-def parse_bool_like(value):
-    # Parse loose boolean-like strings into 0/1.
-    if is_missing(value):
-        return 0
-    s = str(value).strip().lower()
-    return int(s in {"reviewed", "yes", "true", "1", "y", "t"})
-
-
 def parse_float(value, default=None):
-    # Safe float parsing.
     if is_missing(value):
         return default
     try:
@@ -118,143 +102,153 @@ def parse_float(value, default=None):
 
 
 def parse_int(value, default=None):
-    # Safe integer parsing; supports numeric strings and float-like content.
-    f = parse_float(value, default=None)
-    if f is None:
+    parsed = parse_float(value, default=None)
+    if parsed is None:
         return default
     try:
-        return int(f)
+        return int(parsed)
     except Exception:
         return default
 
 
 def clean_text(value):
-    # Normalize a text field for keyword matching.
     if is_missing(value):
         return ""
     return str(value).strip().lower()
 
 
 def split_to_set(value):
-    # Convert a semicolon/comma/pipe separated text field into a cleaned token set.
     if is_missing(value):
         return set()
 
     text = str(value).strip().lower()
     parts = re.split(r"[;,|]", text)
     cleaned = set()
-
     for part in parts:
         token = re.sub(r"\s+", " ", part).strip()
         if token:
             cleaned.add(token)
-
     return cleaned
 
 
 def merge_sets(*values):
-    # Merge multiple tokenized fields into one set.
-    out = set()
+    merged = set()
     for value in values:
-        out |= split_to_set(value)
-    return out
-
-
-def has_overlap(set_a, set_b):
-    # Predicate helper: whether two token sets overlap.
-    return int(len(set_a & set_b) > 0)
+        merged |= split_to_set(value)
+    return merged
 
 
 def safe_get(row, colname):
-    # Read a cell safely from a pandas row.
     if colname is None or colname not in row.index:
         return None
     return row[colname]
 
 
-def build_protein_feature_map(protein_df):
-    # ------------------------------------------------------------------
-    # Step 1. Build per-protein feature records from protein.csv
-    #
-    # Output:
-    #   protein_map[protein_id] = {
-    #       reviewed, high_evidence, membrane_related, has_coiled_coil,
-    #       long_protein, length,
-    #       location_set, pathway_set, go_bp_set, domain_set, family_set
-    #   }
-    # ------------------------------------------------------------------
-    id_col = find_id_column_protein(protein_df)
-    if id_col is None:
-        raise ValueError("protein.csv must contain either 'biogrid_id' or 'index'.")
+def any_token_contains(tokens, keywords):
+    for token in tokens:
+        for keyword in keywords:
+            if keyword in token:
+                return 1
+    return 0
 
-    reviewed_col = find_first_existing(protein_df, ["Reviewed"])
-    pe_col = find_first_existing(protein_df, ["Protein existence"])
-    length_col = find_first_existing(protein_df, ["Length"])
-    pathway_col = find_first_existing(protein_df, ["pathway"])
-    pathway1_col = find_first_existing(protein_df, ["Pathway1"])
-    location_col = find_first_existing(protein_df, ["Subcellular location [CC]"])
-    go_bp_col = find_first_existing(protein_df, ["Gene Ontology (biological process)"])
-    go_col = find_first_existing(protein_df, ["Gene Ontology (GO)"])
-    domain_col = find_first_existing(protein_df, ["domain"])
-    domain_cc_col = find_first_existing(protein_df, ["Domain [CC]"])
-    domain_ft_col = find_first_existing(protein_df, ["Domain [FT]"])
-    family_col = find_first_existing(protein_df, ["Protein families"])
-    tm_col = find_first_existing(protein_df, ["Transmembrane"])
-    coiled_col = find_first_existing(protein_df, ["Coiled coil"])
+
+def has_overlap(set_a, set_b):
+    return int(len(set_a & set_b) > 0)
+
+
+def default_protein_features():
+    return {
+        "high_evidence": 0,
+        "long_protein": 0,
+        "has_coiled_coil": 0,
+        "membrane_related": 0,
+        "nucleus_related": 0,
+        "secreted_related": 0,
+        "location_set": set(),
+        "pathway_set": set(),
+        "domain_set": set(),
+        "family_set": set(),
+    }
+
+
+def build_protein_feature_map(protein_df):
+    # Step 1. Read protein.csv and build node-level predicates and token sets.
+    id_col = find_id_column_protein(protein_df)
+    protein_existence_col = require_columns(
+        protein_df, ["Protein existence"], "Protein existence"
+    )
+    length_col = require_columns(protein_df, ["Length"], "Length")
+    coiled_col = require_columns(protein_df, ["Coiled coil"], "Coiled coil")
+    transmembrane_col = require_columns(protein_df, ["Transmembrane"], "Transmembrane")
+    location_col = require_columns(
+        protein_df, ["Subcellular location [CC]"], "Subcellular location [CC]"
+    )
+    go_cc_col = require_columns(
+        protein_df,
+        ["Gene Ontology (cellular component)"],
+        "Gene Ontology (cellular component)",
+    )
+    signal_peptide_col = require_columns(protein_df, ["Signal peptide"], "Signal peptide")
+    pathway_col = find_optional_column(protein_df, ["pathway"])
+    pathway1_col = find_optional_column(protein_df, ["Pathway1", "Pathway 1"])
+    if pathway_col is None and pathway1_col is None:
+        raise ValueError(
+            "At least one pathway column is required. "
+            "Checked aliases=['pathway'] and ['Pathway1', 'Pathway 1']."
+        )
+
+    domain_col = find_optional_column(protein_df, ["domain"])
+    domain_cc_col = find_optional_column(protein_df, ["Domain [CC]", "Domain CC"])
+    domain_ft_col = find_optional_column(protein_df, ["Domain [FT]", "Domain FT"])
+    if domain_col is None and domain_cc_col is None and domain_ft_col is None:
+        raise ValueError(
+            "At least one domain column is required. "
+            "Checked aliases=['domain'], ['Domain [CC]', 'Domain CC'], "
+            "['Domain [FT]', 'Domain FT']."
+        )
+    family_col = require_columns(protein_df, ["Protein families"], "Protein families")
 
     protein_map = {}
-
     for _, row in protein_df.iterrows():
         pid = parse_int(safe_get(row, id_col), default=None)
         if pid is None:
             continue
 
-        reviewed = parse_bool_like(safe_get(row, reviewed_col))
-        pe_text = clean_text(safe_get(row, pe_col))
-        high_evidence = int(pe_text == "evidence at protein level")
-
-        length_val = parse_int(safe_get(row, length_col), default=None)
-        long_protein = int(length_val is not None and length_val >= 500)
-
-        location_raw = safe_get(row, location_col)
-        location_set = split_to_set(location_raw)
-
-        pathway_set = merge_sets(
-            safe_get(row, pathway_col),
-            safe_get(row, pathway1_col),
-        )
-
-        go_bp_raw = safe_get(row, go_bp_col)
-        if len(split_to_set(go_bp_raw)) == 0:
-            go_bp_raw = safe_get(row, go_col)
-        go_bp_set = split_to_set(go_bp_raw)
-
+        protein_existence = clean_text(safe_get(row, protein_existence_col))
+        length_value = parse_int(safe_get(row, length_col), default=None)
+        location_set = split_to_set(safe_get(row, location_col))
+        go_cc_set = split_to_set(safe_get(row, go_cc_col))
+        pathway_set = merge_sets(safe_get(row, pathway_col), safe_get(row, pathway1_col))
         domain_set = merge_sets(
             safe_get(row, domain_col),
             safe_get(row, domain_cc_col),
             safe_get(row, domain_ft_col),
         )
-
         family_set = split_to_set(safe_get(row, family_col))
 
-        membrane_related = 0
-        if not is_missing(safe_get(row, tm_col)):
-            membrane_related = 1
-        elif "membrane" in clean_text(location_raw):
-            membrane_related = 1
-
-        has_coiled_coil = int(not is_missing(safe_get(row, coiled_col)))
+        membrane_related = int(
+            (not is_missing(safe_get(row, transmembrane_col)))
+            or any_token_contains(location_set, ["membrane"])
+            or any_token_contains(go_cc_set, ["membrane"])
+        )
+        nucleus_related = int(
+            any_token_contains(location_set, ["nucleus", "nuclear"])
+            or any_token_contains(go_cc_set, ["nucleus", "nuclear"])
+        )
+        secreted_related = int(
+            (not is_missing(safe_get(row, signal_peptide_col)))
+            or any_token_contains(location_set, ["extracellular", "secreted"])
+        )
 
         protein_map[pid] = {
-            "reviewed": int(reviewed),
-            "high_evidence": int(high_evidence),
-            "membrane_related": int(membrane_related),
-            "has_coiled_coil": int(has_coiled_coil),
-            "long_protein": int(long_protein),
-            "length": length_val,
+            "high_evidence": int(protein_existence == "evidence at protein level"),
+            "long_protein": int(length_value is not None and length_value >= 500),
+            "has_coiled_coil": int(not is_missing(safe_get(row, coiled_col))),
+            "membrane_related": membrane_related,
+            "nucleus_related": nucleus_related,
+            "secreted_related": secreted_related,
             "location_set": location_set,
             "pathway_set": pathway_set,
-            "go_bp_set": go_bp_set,
             "domain_set": domain_set,
             "family_set": family_set,
         }
@@ -262,202 +256,49 @@ def build_protein_feature_map(protein_df):
     return protein_map
 
 
-def build_positive_edges(interaction_df):
-    # ------------------------------------------------------------------
-    # Step 2. Build deduplicated positive undirected edges from interaction.csv
-    #
-    # For each unique undirected pair (a, b), aggregate:
-    #   - physical_interaction
-    #   - high_conf_interaction
-    #
-    # Output:
-    #   edge_map[(a, b)] = {
-    #       physical_interaction: 0/1,
-    #       high_conf_interaction: 0/1
-    #   }
-    # ------------------------------------------------------------------
+def build_pair_list(interaction_df):
+    # Step 2. Read protein_protein.csv and build unique undirected pairs.
     a_col, b_col = find_interactor_columns(interaction_df)
-    if a_col is None or b_col is None:
-        raise ValueError("interaction.csv must contain recognizable A/B protein ID columns.")
 
-    exp_type_col = find_first_existing(interaction_df, ["Experimental System Type"])
-    score_col = find_first_existing(interaction_df, ["Score"])
-
-    edge_map = {}
-
+    pairs = set()
     for _, row in interaction_df.iterrows():
         a = parse_int(safe_get(row, a_col), default=None)
         b = parse_int(safe_get(row, b_col), default=None)
-
         if a is None or b is None or a == b:
             continue
+        protein_x, protein_y = sorted((a, b))
+        pairs.add((protein_x, protein_y))
 
-        x, y = sorted((a, b))
-
-        exp_type = clean_text(safe_get(row, exp_type_col))
-        physical_interaction = int("physical" in exp_type)
-
-        score = parse_float(safe_get(row, score_col), default=None)
-        high_conf_interaction = int(score is not None and score >= 0.7)
-
-        if (x, y) not in edge_map:
-            edge_map[(x, y)] = {
-                "physical_interaction": 0,
-                "high_conf_interaction": 0,
-            }
-
-        edge_map[(x, y)]["physical_interaction"] = max(
-            edge_map[(x, y)]["physical_interaction"],
-            physical_interaction,
-        )
-        edge_map[(x, y)]["high_conf_interaction"] = max(
-            edge_map[(x, y)]["high_conf_interaction"],
-            high_conf_interaction,
-        )
-
-    return edge_map
+    return sorted(pairs)
 
 
-def sample_negative_edges(node_ids, positive_edge_set, num_negatives, seed=42):
-    # ------------------------------------------------------------------
-    # Step 3. Randomly sample negative edges
-    #
-    # Rules:
-    #   - not a positive edge
-    #   - no self-loop
-    #   - undirected edge stored as sorted tuple
-    # ------------------------------------------------------------------
-    rng = random.Random(seed)
-    node_ids = list(sorted(set(node_ids)))
-
-    if len(node_ids) < 2:
-        return []
-
-    negative_edges = set()
-    max_attempts = max(100000, num_negatives * 50)
-    attempts = 0
-
-    while len(negative_edges) < num_negatives and attempts < max_attempts:
-        a = rng.choice(node_ids)
-        b = rng.choice(node_ids)
-        attempts += 1
-
-        if a == b:
-            continue
-
-        edge = tuple(sorted((a, b)))
-        if edge in positive_edge_set:
-            continue
-        if edge in negative_edges:
-            continue
-
-        negative_edges.add(edge)
-
-    if len(negative_edges) < num_negatives:
-        print(
-            f"[WARN] Requested {num_negatives} negative edges, "
-            f"but only sampled {len(negative_edges)}."
-        )
-
-    return sorted(negative_edges)
-
-
-def default_protein_features():
-    # Default fallback features when a protein is missing from protein_map.
-    return {
-        "reviewed": 0,
-        "high_evidence": 0,
-        "membrane_related": 0,
-        "has_coiled_coil": 0,
-        "long_protein": 0,
-        "length": None,
-        "location_set": set(),
-        "pathway_set": set(),
-        "go_bp_set": set(),
-        "domain_set": set(),
-        "family_set": set(),
-    }
-
-
-def build_pairwise_rows(edge_map, negative_edges, protein_map):
-    # ------------------------------------------------------------------
-    # Step 4. Convert positive + negative edges into the final pair-wise table
-    #
-    # Each row corresponds to one protein pair (protein_a, protein_b) and
-    # contains:
-    #   - label
-    #   - pair-wise boolean predicates
-    #   - edge-level flags from the interaction table
-    #
-    # Output:
-    #   List[dict] -> later written to pairwise_table.csv
-    # ------------------------------------------------------------------
+def build_pairwise_rows(pair_list, protein_map):
+    # Step 3. Expand constant predicates to x_/y_ columns and keep
+    # variable predicates as pair-level columns.
     rows = []
-
-    def get_feat(pid):
-        return protein_map.get(pid, default_protein_features())
-
-    all_edges = []
-
-    for (a, b), attrs in edge_map.items():
-        all_edges.append(
-            {
-                "protein_a": int(a),
-                "protein_b": int(b),
-                "label": 1,
-                "physical_interaction": int(attrs["physical_interaction"]),
-                "high_conf_interaction": int(attrs["high_conf_interaction"]),
-                "sampled_non_interaction": 0,
-            }
-        )
-
-    for a, b in negative_edges:
-        all_edges.append(
-            {
-                "protein_a": int(a),
-                "protein_b": int(b),
-                "label": 0,
-                "physical_interaction": 0,
-                "high_conf_interaction": 0,
-                "sampled_non_interaction": 1,
-            }
-        )
-
-    for edge_row in all_edges:
-        a = edge_row["protein_a"]
-        b = edge_row["protein_b"]
-        fa = get_feat(a)
-        fb = get_feat(b)
-
-        len_a = fa["length"]
-        len_b = fb["length"]
-        if len_a is None or len_b is None or max(len_a, len_b) == 0:
-            length_similar = 0
-        else:
-            length_similar = int(abs(len_a - len_b) / max(len_a, len_b) <= 0.2)
+    for protein_x, protein_y in pair_list:
+        x_feat = protein_map.get(protein_x, default_protein_features())
+        y_feat = protein_map.get(protein_y, default_protein_features())
 
         row = {
-            "protein_a": a,
-            "protein_b": b,
-            "label": int(edge_row["label"]),
-            "both_reviewed": int(fa["reviewed"] == 1 and fb["reviewed"] == 1),
-            "both_high_evidence": int(fa["high_evidence"] == 1 and fb["high_evidence"] == 1),
-            "both_membrane_related": int(
-                fa["membrane_related"] == 1 and fb["membrane_related"] == 1
-            ),
-            "both_has_coiled_coil": int(
-                fa["has_coiled_coil"] == 1 and fb["has_coiled_coil"] == 1
-            ),
-            "both_long_protein": int(fa["long_protein"] == 1 and fb["long_protein"] == 1),
-            "same_location": has_overlap(fa["location_set"], fb["location_set"]),
-            "same_pathway": has_overlap(fa["pathway_set"], fb["pathway_set"]),
-            "go_bp_overlap": has_overlap(fa["go_bp_set"], fb["go_bp_set"]),
-            "domain_match": has_overlap(fa["domain_set"], fb["domain_set"]),
-            "family_match": has_overlap(fa["family_set"], fb["family_set"]),
-            "length_similar": int(length_similar),
-            "physical_interaction": int(edge_row["physical_interaction"]),
-            "high_conf_interaction": int(edge_row["high_conf_interaction"]),
-            "sampled_non_interaction": int(edge_row["sampled_non_interaction"]),
+            "protein_x": int(protein_x),
+            "protein_y": int(protein_y),
+            "x_high_evidence": int(x_feat["high_evidence"]),
+            "y_high_evidence": int(y_feat["high_evidence"]),
+            "x_long_protein": int(x_feat["long_protein"]),
+            "y_long_protein": int(y_feat["long_protein"]),
+            "x_has_coiled_coil": int(x_feat["has_coiled_coil"]),
+            "y_has_coiled_coil": int(y_feat["has_coiled_coil"]),
+            "x_membrane_related": int(x_feat["membrane_related"]),
+            "y_membrane_related": int(y_feat["membrane_related"]),
+            "x_nucleus_related": int(x_feat["nucleus_related"]),
+            "y_nucleus_related": int(y_feat["nucleus_related"]),
+            "x_secreted_related": int(x_feat["secreted_related"]),
+            "y_secreted_related": int(y_feat["secreted_related"]),
+            "same_location": has_overlap(x_feat["location_set"], y_feat["location_set"]),
+            "same_pathway": has_overlap(x_feat["pathway_set"], y_feat["pathway_set"]),
+            "domain_match": has_overlap(x_feat["domain_set"], y_feat["domain_set"]),
+            "family_match": has_overlap(x_feat["family_set"], y_feat["family_set"]),
         }
         rows.append(row)
 
@@ -465,66 +306,27 @@ def build_pairwise_rows(edge_map, negative_edges, protein_map):
 
 
 def build_pairwise_table(protein_csv, interaction_csv, output_csv, neg_ratio=1.0):
-    # ------------------------------------------------------------------
-    # Reusable pipeline entry:
-    #   protein.csv + one interaction.csv
-    #   -> one pair-wise predicate table CSV
-    #
-    # This is used both by the script main() and by batch pattern runners.
-    # ------------------------------------------------------------------
-    random.seed(SEED)
-    np.random.seed(SEED)
-
+    # Reusable entrypoint kept for compatibility with downstream scripts.
     protein_df = pd.read_csv(protein_csv, low_memory=False)
     interaction_df = pd.read_csv(interaction_csv, low_memory=False)
 
     protein_map = build_protein_feature_map(protein_df)
-    protein_node_ids = sorted(protein_map.keys())
+    pair_list = build_pair_list(interaction_df)
+    rows = build_pairwise_rows(pair_list, protein_map)
 
-    edge_map = build_positive_edges(interaction_df)
-    positive_edge_set = set(edge_map.keys())
-    num_positive = len(positive_edge_set)
-
-    num_negative = int(round(num_positive * neg_ratio))
-    negative_edges = sample_negative_edges(
-        node_ids=protein_node_ids,
-        positive_edge_set=positive_edge_set,
-        num_negatives=num_negative,
-        seed=SEED,
-    )
-
-    rows = build_pairwise_rows(edge_map, negative_edges, protein_map)
-    out_df = pd.DataFrame(rows)
-
-    predicate_cols = [
-        "label",
-        "both_reviewed",
-        "both_high_evidence",
-        "both_membrane_related",
-        "both_has_coiled_coil",
-        "both_long_protein",
-        "same_location",
-        "same_pathway",
-        "go_bp_overlap",
-        "domain_match",
-        "family_match",
-        "length_similar",
-        "physical_interaction",
-        "high_conf_interaction",
-        "sampled_non_interaction",
-    ]
-    for col in predicate_cols:
-        out_df[col] = out_df[col].fillna(0).astype(int)
+    out_df = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    for col in OUTPUT_COLUMNS[2:]:
+        out_df[col] = pd.to_numeric(out_df[col], errors="coerce").fillna(0).astype(int)
 
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    out_df = out_df.sort_values(["protein_a", "protein_b"]).reset_index(drop=True)
+    out_df = out_df.sort_values(["protein_x", "protein_y"]).reset_index(drop=True)
     out_df.to_csv(output_csv, index=False)
 
     summary = {
-        "protein_nodes": len(protein_node_ids),
-        "positive_edges": num_positive,
-        "negative_edges": len(negative_edges),
+        "protein_nodes": len(protein_map),
+        "positive_edges": len(pair_list),
+        "negative_edges": 0,
         "output_rows": len(out_df),
         "output_csv": str(output_csv),
     }
@@ -532,21 +334,15 @@ def build_pairwise_table(protein_csv, interaction_csv, output_csv, neg_ratio=1.0
 
 
 def main():
-    # argparse is included as requested, but this script does not rely on
-    # command-line parameters. Edit the file-level path constants instead.
-    parser = argparse.ArgumentParser(description="Build pair-wise protein table.")
+    parser = argparse.ArgumentParser(description="Build endpoint-expanded PPI pairwise predicate table.")
     parser.parse_args([])
 
     base_dir = Path(__file__).resolve().parent
-    print(base_dir)
-    protein_path = PROTEIN_CSV
-    interaction_path = INTERACTION_CSV
     output_path = base_dir / OUTPUT_CSV
     _, summary = build_pairwise_table(
-        protein_csv=protein_path,
-        interaction_csv=interaction_path,
+        protein_csv=PROTEIN_CSV,
+        interaction_csv=INTERACTION_CSV,
         output_csv=output_path,
-        neg_ratio=NEG_RATIO,
     )
 
     print(f"Protein nodes: {summary['protein_nodes']}")
