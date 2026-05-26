@@ -51,11 +51,12 @@ LR = 1e-3
 EPOCHS = 5
 MARGIN = 1.0
 
-SELECTOR = "fps"
+# SELECTOR = "fps"
+SELECTOR = "pickpatterns"
 TARGET_NUM = 200
 
-DEFAULT_EDGE_CSV = os.path.join(CURRENT_DIR, "data", "protein_protein.csv")
-DEFAULT_NODE_CSV = os.path.join(CURRENT_DIR, "data", "node.csv")
+DEFAULT_EDGE_CSV = "/home/yyyy/codework/GARplus/enumeration-discovery/data/protein_protein.csv"
+DEFAULT_NODE_CSV = "/home/yyyy/codework/GARplus/enumeration-discovery/data/node.csv"
 PROCESSED_DIR = os.path.join(CURRENT_DIR, "processed", "ppi")
 
 ENCODER_FILENAME = "ppi_order_encoder.pt"
