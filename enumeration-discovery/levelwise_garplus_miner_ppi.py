@@ -23,6 +23,7 @@ Important limitations of this first version:
 """
 
 import json
+import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -31,20 +32,227 @@ from typing import Any
 import networkx as nx
 import pandas as pd
 
-import build_pattern_edge_node_bn as pattern_bn_module
-from levelwise_predicate_miner import (
-    compute_body_mask,
-    compute_rule_stats,
-    filter_candidate_extensions_by_bn,
-    get_candidate_predicates,
-    get_predicate_family_map,
-    load_family_bn_edges,
-    load_predicate_repository,
-    load_predicate_table,
-)
-
-
 CURRENT_DIR = Path(__file__).resolve().parent
+# Allow running this file from the repo root by ensuring `enumeration-discovery`
+# is on sys.path so sibling modules can be imported.
+current_dir_str = str(CURRENT_DIR)
+if current_dir_str not in sys.path:
+    sys.path.insert(0, current_dir_str)
+
+import build_pattern_edge_node_bn as pattern_bn_module
+
+BN_FALLBACK_SCORE = 0.1
+
+
+def load_predicate_repository(repo_path: str) -> dict:
+    with open(repo_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_predicate_table(table_path: str) -> pd.DataFrame:
+    return pd.read_csv(table_path)
+
+
+def load_family_bn_edges(family_bns_dir: str) -> dict[str, dict]:
+    """
+    Load the learned family-wise Predicate-BNs as undirected adjacency maps.
+
+    Expected layout:
+      family_bns/
+        family_<name>/
+          result.json  (expects {"status": "learned"} when usable)
+          edges.csv    (expects columns: source,target)
+    """
+    family_bns_path = Path(family_bns_dir)
+    family_bn_states: dict[str, dict] = {}
+    if not family_bns_path.exists():
+        return family_bn_states
+
+    for family_dir in sorted(family_bns_path.glob("family_*")):
+        if not family_dir.is_dir():
+            continue
+
+        family_name = family_dir.name[len("family_") :]
+        result_path = family_dir / "result.json"
+        edges_path = family_dir / "edges.csv"
+
+        status = "skipped"
+        if result_path.exists():
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                status = str(result.get("status", "skipped"))
+            except Exception:
+                status = "skipped"
+
+        neighbors: dict[str, set[str]] = {}
+        nodes: set[str] = set()
+
+        if status == "learned" and edges_path.exists():
+            try:
+                edges_df = pd.read_csv(edges_path)
+                for _, row in edges_df.iterrows():
+                    src = str(row["source"])
+                    dst = str(row["target"])
+                    nodes.add(src)
+                    nodes.add(dst)
+                    neighbors.setdefault(src, set()).add(dst)
+                    neighbors.setdefault(dst, set()).add(src)
+            except Exception:
+                status = "skipped"
+                neighbors = {}
+                nodes = set()
+
+        family_bn_states[family_name] = {
+            "neighbors": neighbors,
+            "nodes": nodes,
+            "status": status,
+        }
+
+    return family_bn_states
+
+
+def get_predicate_family_map(repository: dict) -> dict[str, str]:
+    pred_family: dict[str, str] = {}
+    for pred in repository.get("predicates", []):
+        pid = pred.get("pid")
+        family = pred.get("family", "unknown")
+        if pid is not None:
+            pred_family[str(pid)] = str(family)
+    return pred_family
+
+
+def get_candidate_predicates(
+    repository: dict,
+    table: pd.DataFrame,
+    exclude_families: set[str] | None = None,
+    exclude_sources: set[str] | None = None,
+    min_support: int = 1,
+    max_predicates: int | None = None,
+) -> list[str]:
+    exclude_families = set() if exclude_families is None else set(exclude_families)
+    exclude_sources = set() if exclude_sources is None else set(exclude_sources)
+
+    table_columns = set(table.columns) - {"pattern_id"}
+    support_series = table.drop(columns=["pattern_id"], errors="ignore").sum().sort_values(ascending=False)
+
+    candidates: list[tuple[str, int]] = []
+    for pred in repository.get("predicates", []):
+        pid = str(pred.get("pid"))
+        family = str(pred.get("family", "unknown"))
+        source = str(pred.get("source", "unknown"))
+
+        if pid not in table_columns:
+            continue
+        if family in exclude_families:
+            continue
+        if source in exclude_sources:
+            continue
+
+        support = int(support_series.get(pid, 0))
+        if support < min_support:
+            continue
+        candidates.append((pid, support))
+
+    candidates.sort(key=lambda x: (-x[1], x[0]))
+    if max_predicates is not None:
+        candidates = candidates[:max_predicates]
+    return [pid for pid, _ in candidates]
+
+
+def compute_body_mask(table: pd.DataFrame, body: frozenset[str]) -> pd.Series:
+    if not body:
+        return pd.Series(True, index=table.index)
+    return table[list(body)].all(axis=1)
+
+
+def compute_rule_stats(table: pd.DataFrame, body: frozenset[str], head: str) -> dict:
+    num_patterns = int(table.shape[0])
+    body_mask = compute_body_mask(table, body)
+    body_support = int(body_mask.sum())
+    head_support = int(table[head].sum())
+
+    if body_support == 0:
+        support = 0
+        confidence = 0.0
+    else:
+        support = int((body_mask & (table[head] == 1)).sum())
+        confidence = float(support / body_support)
+
+    head_prob = float(head_support / num_patterns) if num_patterns > 0 else 0.0
+    lift = 0.0 if head_prob <= 0 else float(confidence / head_prob)
+
+    return {
+        "body_support": body_support,
+        "support": support,
+        "confidence": confidence,
+        "head_support": head_support,
+        "lift": lift,
+    }
+
+
+def bn_neighbor_score(
+    body: frozenset[str],
+    candidate: str,
+    family_bn_states: dict,
+    predicate_family: dict[str, str],
+) -> float:
+    """
+    Score one candidate predicate extension using the learned family BN graph.
+
+    Signals:
+      - direct BN neighbor => 1.0
+      - 2-hop neighbor     => 0.5
+      - otherwise          => BN_FALLBACK_SCORE
+    """
+    candidate_family = predicate_family.get(candidate)
+    if candidate_family is None:
+        return BN_FALLBACK_SCORE
+
+    family_state = family_bn_states.get(candidate_family)
+    if not family_state or family_state.get("status") != "learned":
+        return BN_FALLBACK_SCORE
+
+    family_nodes = set(family_state.get("nodes", set()))
+    if candidate not in family_nodes:
+        return BN_FALLBACK_SCORE
+
+    neighbors: dict[str, set[str]] = family_state.get("neighbors", {})
+    candidate_neighbors = set(neighbors.get(candidate, set()))
+    if not candidate_neighbors:
+        return BN_FALLBACK_SCORE
+
+    body_vars = set(body)
+    if body_vars & candidate_neighbors:
+        return 1.0
+
+    for b in body_vars:
+        for hop in neighbors.get(b, set()):
+            if candidate in neighbors.get(hop, set()):
+                return 0.5
+
+    return BN_FALLBACK_SCORE
+
+
+def filter_candidate_extensions_by_bn(
+    body: frozenset[str],
+    candidates: list[str],
+    family_bn_states: dict,
+    predicate_family: dict[str, str],
+    tau_bn: float,
+    top_k: int | None,
+) -> list[tuple[str, float]]:
+    scored: list[tuple[str, float]] = []
+    for cand in candidates:
+        score = bn_neighbor_score(body, cand, family_bn_states, predicate_family)
+        if score >= tau_bn:
+            scored.append((cand, float(score)))
+
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    if top_k is not None:
+        scored = scored[:top_k]
+    return scored
+
 #pipeline: pick_patterns.py -> predicate_construction.py
 SELECTED_PATH = str(CURRENT_DIR / "processed" / "ppi" / "ppi_selected.pt")
 REPO_PATH = str(CURRENT_DIR / "processed" / "ppi" / "global_predicate_repo" / "global_predicate_repository.json")

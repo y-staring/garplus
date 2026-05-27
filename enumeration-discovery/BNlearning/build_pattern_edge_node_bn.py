@@ -16,6 +16,7 @@ candidate pattern extensions.
 """
 
 import json
+import sys
 import warnings
 from collections import defaultdict
 from itertools import combinations
@@ -32,6 +33,14 @@ except ImportError:
     # Older pgmpy releases expose the same score under BicScore.
     from pgmpy.estimators import BicScore as BICScore
 
+CURRENT_DIR = Path(__file__).resolve().parent
+BASE_DIR = CURRENT_DIR.parent
+
+# Ensure `enumeration-discovery` is importable when running from repo root.
+base_dir_str = str(BASE_DIR)
+if base_dir_str not in sys.path:
+    sys.path.insert(0, base_dir_str)
+
 try:
     from pgmpy.models import DiscreteBayesianNetwork as BayesianModel
 except ImportError:
@@ -40,9 +49,7 @@ except ImportError:
 
 from inspect_graph import DEFAULT_SELECTED_PATH, SelectedPPIDataset
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = CURRENT_DIR / "processed" / "ppi" / "pattern_multi_bn"
+OUTPUT_DIR = BASE_DIR / "processed" / "ppi" / "pattern_multi_bn"
 SELECTED_PATH = Path(DEFAULT_SELECTED_PATH)
 
 FAMILIES = ["role", "clustering", "core"]

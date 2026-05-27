@@ -29,6 +29,7 @@ cached topology graph so edge-label predicates can still be constructed.
 import json
 import pickle
 import re
+import sys
 import warnings
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -56,6 +57,15 @@ except ImportError:
 # Optional project imports
 # ---------------------------------------------------------------------
 
+CURRENT_DIR = Path(__file__).resolve().parent
+BASE_DIR = CURRENT_DIR.parent
+
+# Ensure `enumeration-discovery` is importable when running this script from the
+# repo root (or other working directories).
+base_dir_str = str(BASE_DIR)
+if base_dir_str not in sys.path:
+    sys.path.insert(0, base_dir_str)
+
 try:
     from inspect_graph import DEFAULT_SELECTED_PATH, SelectedPPIDataset
 except Exception:
@@ -69,10 +79,8 @@ except Exception:
     DEFAULT_NODE_CSV = None
     build_ppi_graph = None
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = CURRENT_DIR / "processed" / "ppi" / "global_predicate_repo"
-DEFAULT_BIG_GRAPH_CACHE = CURRENT_DIR / "processed" / "ppi" / "ppi_big_graph.pkl"
+OUTPUT_DIR = BASE_DIR / "processed" / "ppi" / "global_predicate_repo"
+DEFAULT_BIG_GRAPH_CACHE = BASE_DIR / "processed" / "ppi" / "ppi_big_graph.pkl"
 # Rich interaction table used only to re-attach row-level edge attributes
 # onto the cached big-graph topology.
 DEFAULT_RICH_PPI_CSV = "/home/yyyy/codework/GARplus/GNN/code/DDA_test/data/去病图数据/protein_protein.csv"
@@ -90,7 +98,11 @@ MAX_INDEGREE = 2
 MAX_ITER = int(1e4)
 MAX_EDGE_LABEL_VALUE_LEN = 60
 
-SELECTED_PATH = str(DEFAULT_SELECTED_PATH) if DEFAULT_SELECTED_PATH is not None else None
+SELECTED_PATH = (
+    str(DEFAULT_SELECTED_PATH)
+    if DEFAULT_SELECTED_PATH is not None
+    else str(BASE_DIR / "processed" / "ppi" / "ppi_selected.pt")
+)
 PPI_CSV = DEFAULT_RICH_PPI_CSV
 EDGE_CSV = str(DEFAULT_EDGE_CSV) if DEFAULT_EDGE_CSV is not None else None
 NODE_CSV = str(DEFAULT_NODE_CSV) if DEFAULT_NODE_CSV is not None else None

@@ -11,6 +11,7 @@ from torch_geometric.data import Batch, Data, InMemoryDataset
 from tqdm import tqdm
 
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+BASE_DIR = os.path.dirname(CURRENT_DIR)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 DIGRESS_ROOT = os.path.join(PROJECT_ROOT, "DiGress", "DiGress-main")
 if DIGRESS_ROOT not in sys.path:
@@ -55,9 +56,9 @@ MARGIN = 1.0
 SELECTOR = "pickpatterns"
 TARGET_NUM = 200
 
-DEFAULT_EDGE_CSV = "/home/yyyy/codework/GARplus/enumeration-discovery/data/protein_protein.csv"
-DEFAULT_NODE_CSV = "/home/yyyy/codework/GARplus/enumeration-discovery/data/node.csv"
-PROCESSED_DIR = os.path.join(CURRENT_DIR, "processed", "ppi")
+DEFAULT_EDGE_CSV = os.path.join(BASE_DIR, "data", "protein_protein.csv")
+DEFAULT_NODE_CSV = os.path.join(BASE_DIR, "data", "node.csv")
+PROCESSED_DIR = os.path.join(BASE_DIR, "processed", "ppi")
 
 ENCODER_FILENAME = "ppi_order_encoder.pt"
 EMB_FILENAME = "ppi_train_embeddings.pt"
