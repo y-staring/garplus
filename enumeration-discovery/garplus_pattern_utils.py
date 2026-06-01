@@ -57,36 +57,197 @@ def build_union_graph(pattern_graphs: list[tuple[int, nx.Graph]]) -> nx.Graph:
     return union_graph
 
 
-def initialize_seed_patterns(pattern_graphs, max_seed_edges=1) -> list[PatternState]:
+# def initialize_seed_patterns(pattern_graphs, max_seed_edges=1) -> list[PatternState]:
+#     #TODO 修改掉这里，没有单个节点的pattern，找不出来的
+#     """
+#     Initialize the first vertical level P_1.
+
+#     Prefer all sampled patterns with exactly one edge.
+#     If there are none, use the smallest-edge bucket among sampled patterns.
+#     De-duplicate by pattern_signature.
+#     """
+#     if not pattern_graphs:
+#         return []
+
+#     edge_buckets: dict[int, list[nx.Graph]] = {}
+#     for _, graph in pattern_graphs:
+#         edge_buckets.setdefault(int(graph.number_of_edges()), []).append(graph)
+
+#     if max_seed_edges in edge_buckets:
+#         seed_graphs = edge_buckets[max_seed_edges]
+#     else:
+#         min_edges = min(edge_buckets.keys())
+#         seed_graphs = edge_buckets[min_edges]
+
+#     seen = set()
+#     seeds: list[PatternState] = []
+#     for graph in seed_graphs:
+#         state = make_pattern_state(graph)
+#         if state.pattern_id in seen:
+#             continue
+#         seen.add(state.pattern_id)
+#         seeds.append(state)
+#     return seeds
+
+def initialize_seed_patterns(
+    pattern_graphs,
+    max_seed_edges: int = 1,
+    positive_only: bool = True,
+    allowed_edge_labels: set[str] | None = None,
+) -> list[PatternState]:
     """
     Initialize the first vertical level P_1.
 
-    Prefer all sampled patterns with exactly one edge.
-    If there are none, use the smallest-edge bucket among sampled patterns.
-    De-duplicate by pattern_signature.
+    GAR+ does not start from single-node patterns. Instead, we initialize
+    P_1 with all one-edge positive structural patterns extracted from the
+    sampled patterns.
+
+    Why not directly use sampled patterns with one edge?
+    --------------------------------------------------
+    Some sampled patterns may already contain multiple edges. If we only
+    search for existing 1-edge sampled patterns, P_1 may be empty. Therefore,
+    we extract every edge from every sampled graph and build a canonical
+    one-edge pattern from it.
+
+    Parameters
+    ----------
+    pattern_graphs:
+        List of sampled pattern graphs, usually in the form:
+            [(pattern_id, nx.Graph), ...]
+        or simply:
+            [nx.Graph, ...]
+
+    max_seed_edges:
+        Kept for compatibility. For GAR+, the default seed level should be
+        one-edge patterns.
+
+    positive_only:
+        If True, negative/non-edge relations are not used as structural seed
+        patterns. Negative edges should be handled later as predicates in
+        horizontal spawning.
+
+    allowed_edge_labels:
+        Optional set of allowed structural edge labels. If provided, only
+        edges whose label belongs to this set are used as seeds.
+
+    Returns
+    -------
+    seeds:
+        A deduplicated list of PatternState, each corresponding to a one-edge
+        positive structural pattern.
     """
     if not pattern_graphs:
         return []
 
-    edge_buckets: dict[int, list[nx.Graph]] = {}
-    for _, graph in pattern_graphs:
-        edge_buckets.setdefault(int(graph.number_of_edges()), []).append(graph)
+    seed_graphs: list[nx.Graph] = []
 
-    if max_seed_edges in edge_buckets:
-        seed_graphs = edge_buckets[max_seed_edges]
-    else:
-        min_edges = min(edge_buckets.keys())
-        seed_graphs = edge_buckets[min_edges]
+    for item in pattern_graphs:
+        # Support both [(id, graph), ...] and [graph, ...]
+        if isinstance(item, tuple) and len(item) == 2:
+            _, graph = item
+        else:
+            graph = item
+
+        if graph is None or graph.number_of_edges() == 0:
+            continue
+
+        # Keep the graph type: Graph / DiGraph / MultiGraph / MultiDiGraph
+        graph_cls = graph.__class__
+
+        # MultiGraph has keys=True; normal Graph does not.
+        if graph.is_multigraph():
+            edge_iter = graph.edges(keys=True, data=True)
+            for u, v, key, edata in edge_iter:
+                if skip_seed_edge(edata, positive_only, allowed_edge_labels):
+                    continue
+
+                g1 = graph_cls()
+                g1.add_node(u, **dict(graph.nodes[u]))
+                g1.add_node(v, **dict(graph.nodes[v]))
+                g1.add_edge(u, v, key=key, **dict(edata))
+                seed_graphs.append(g1)
+        else:
+            edge_iter = graph.edges(data=True)
+            for u, v, edata in edge_iter:
+                if skip_seed_edge(edata, positive_only, allowed_edge_labels):
+                    continue
+
+                g1 = graph_cls()
+                g1.add_node(u, **dict(graph.nodes[u]))
+                g1.add_node(v, **dict(graph.nodes[v]))
+                g1.add_edge(u, v, **dict(edata))
+                seed_graphs.append(g1)
+
+    # If no valid one-edge positive seeds are extracted, fallback to the old logic.
+    # This fallback is only for robustness, not the preferred GAR+ behavior.
+    if not seed_graphs:
+        edge_buckets: dict[int, list[nx.Graph]] = {}
+        for item in pattern_graphs:
+            if isinstance(item, tuple) and len(item) == 2:
+                _, graph = item
+            else:
+                graph = item
+            edge_buckets.setdefault(int(graph.number_of_edges()), []).append(graph)
+
+        if max_seed_edges in edge_buckets:
+            seed_graphs = edge_buckets[max_seed_edges]
+        else:
+            min_edges = min(edge_buckets.keys())
+            seed_graphs = edge_buckets[min_edges]
 
     seen = set()
     seeds: list[PatternState] = []
+
     for graph in seed_graphs:
         state = make_pattern_state(graph)
         if state.pattern_id in seen:
             continue
         seen.add(state.pattern_id)
         seeds.append(state)
+
     return seeds
+
+
+def skip_seed_edge(
+    edge_data: dict,
+    positive_only: bool = True,
+    allowed_edge_labels: set[str] | None = None,
+) -> bool:
+    """
+    Decide whether an edge should be excluded from seed patterns.
+
+    Negative edges should not be used as structural pattern seeds. In GAR+,
+    negative edges are better represented as predicates in X, not as edges
+    in Q.
+    """
+    label = (
+        edge_data.get("label")
+        or edge_data.get("edge_label")
+        or edge_data.get("type")
+        or edge_data.get("relation")
+    )
+    #TODO 把传入数据补充一下negtive与否
+    sign = (
+        edge_data.get("sign")
+        or edge_data.get("polarity")
+        or edge_data.get("edge_sign")
+    )
+
+    is_negative = (
+        edge_data.get("negative") is True
+        or edge_data.get("is_negative") is True
+        or sign in {"-", "negative", "neg", 0, -1}
+        or str(label).startswith("neg_")
+        or str(label).startswith("not_")
+    )
+
+    if positive_only and is_negative:
+        return True
+
+    if allowed_edge_labels is not None and label not in allowed_edge_labels:
+        return True
+
+    return False
 
 
 def compute_pattern_match_ids(
@@ -184,4 +345,3 @@ def extend_pattern(Q: nx.Graph, gamma: tuple[Any, Any]) -> nx.Graph:
         Q_gamma.add_node(v)
     Q_gamma.add_edge(u, v)
     return Q_gamma
-

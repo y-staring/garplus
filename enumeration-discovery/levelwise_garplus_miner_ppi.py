@@ -101,7 +101,7 @@ def _load_pattern_bn_module():
 
 
 def levelwise_garplus_mine(
-    pattern_graphs,
+    pattern_graphs,  #sampled graphs
     predicate_table: pd.DataFrame,
     repository: dict,
     pattern_bn_state: dict | None,
@@ -127,6 +127,7 @@ def levelwise_garplus_mine(
     dict,
 ]:
     start_time = time.time()
+    #union all subgraph to a big one
     union_graph = build_union_graph(pattern_graphs)
 
     # Initialize pattern tree roots from sampled patterns S_G.
@@ -166,9 +167,10 @@ def levelwise_garplus_mine(
         "rule_bn_pruned": 0,
         "rule_support_pruned": 0,
     }
-
+    #要多大就挖多少层
     for edge_level in range(1, max_pattern_edges + 1):
         if not current_level_ids:
+            #TODO seed有问题，改掉
             print(f"[Pattern-Level {edge_level}] level is empty, stop early.")
             break
 
@@ -184,6 +186,7 @@ def levelwise_garplus_mine(
             node = pattern_nodes[pattern_id]
 
             match_ids = compute_pattern_match_ids(node.pattern, pattern_graphs, support_mode=PATTERN_SUPPORT_MODE)
+            #计算当前pattern的匹配在sampled graph里的次数，作为support
             node.support = int(len(match_ids))
             node.is_frequent = bool(node.support >= sigma_pattern)
 
@@ -340,7 +343,7 @@ def levelwise_garplus_mine(
 
 def main():
     start_time = time.time()
-
+    #加载BN文件
     pattern_bn_module = _load_pattern_bn_module()
 
     pattern_graphs = pattern_bn_module.load_selected_pattern_graphs(SELECTED_PATH)

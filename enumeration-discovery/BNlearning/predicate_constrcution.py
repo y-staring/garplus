@@ -83,7 +83,7 @@ OUTPUT_DIR = BASE_DIR / "processed" / "ppi" / "global_predicate_repo"
 DEFAULT_BIG_GRAPH_CACHE = BASE_DIR / "processed" / "ppi" / "ppi_big_graph.pkl"
 # Rich interaction table used only to re-attach row-level edge attributes
 # onto the cached big-graph topology.
-DEFAULT_RICH_PPI_CSV = "/home/yyyy/codework/GARplus/GNN/code/DDA_test/data/去病图数据/protein_protein.csv"
+DEFAULT_RICH_PPI_CSV = str(CURRENT_DIR.parent / "data" / "protein_protein.csv")
 
 
 # ---------------------------------------------------------------------
@@ -142,6 +142,102 @@ NODE_CATEGORICAL_DERIVED_FIELDS = [
     "clustering_bin",
     "core_bin",
 ]
+
+#============================negative edges============================
+#TODO 核对一下后面的逻辑，只保留对的
+INCLUDE_NEG_EDGES = True
+
+# 你的 CSV 里用于标注负边的列名。
+# 这里写多个候选名，代码会自动找存在的那一个。
+NEG_EDGE_FLAG_COLUMNS = [
+    # "is_negative",
+    # "negative",
+    # "neg",
+    # "label_is_negative",
+    # "edge_is_negative",
+    # "relation_sign",
+    # "sign",
+    "type"
+]
+
+# 哪些值表示负边
+NEG_EDGE_TRUE_VALUES = {
+    # True,
+    # 1,
+    # "1",
+    # "true",
+    # "True",
+    # "TRUE",
+    # "yes",
+    # "Yes",
+    # "YES",
+    # "y",
+    # "Y",
+    "negative",
+    # "Negative",
+    # "NEGATIVE",
+    # "neg",
+    # "NEG",
+    # "-",
+    # "-1",
+}
+
+# 空值、不填、0、false 都不当作负边
+NEG_EDGE_FALSE_VALUES = {
+    False,
+    0,
+    "0",
+    "false",
+    "False",
+    "FALSE",
+    "no",
+    "No",
+    "NO",
+    "n",
+    "N",
+    "positive",
+    "Positive",
+    "POSITIVE",
+    "pos",
+    "POS",
+    "+",
+    "1.0",  # 如果你这里不想把 1.0 当负边，可以删掉
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------

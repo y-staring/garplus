@@ -244,6 +244,7 @@ def predicate_tree_search_for_pattern(
     head_families: set[str] | None = None,
 ) -> tuple[list[GARPlusRule], list[RuleTreeNode], dict]:
     """
+    #TODO not fixed pattern
     Rule Search Tree for a fixed pattern Q.
 
     The tree roots are Q[x](empty -> p0). Nodes expand by adding one predicate
