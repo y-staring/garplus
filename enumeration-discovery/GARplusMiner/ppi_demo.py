@@ -10,6 +10,7 @@ from predicate_bn import PredicateBayesianNetwork, PredicateBNConfig
 from predicate_selection import DecisionTreePredicateSelector, FPGrowthPredicateSelector, Rule
 from graph_types import FrequentPattern, PatternOptions
 from ppi_loader import build_ppi_seed_pattern, load_ppi_csv
+from sampled_pt_loader import build_sampled_seed_pattern, load_sampled_pt_graph
 from rulegeneration import (
     FreqCount,
     PatternView,
@@ -29,7 +30,9 @@ from rulegeneration import (
 CSV_PATH: Optional[str] = r"D:\CodeWork\python\GAR+\数据\去病图数据\去病图数据\protein_protein.csv"
 PROTEIN_CSV_PATH: Optional[str] = r"D:\CodeWork\python\GAR+\数据\去病图数据\去病图数据\protein.csv"
 AUTO_DISCOVER_IF_MISSING = False
-MODE = "decision-tree"  # pattern-only | decision-tree | fp-growth
+USE_SAMPLED_PT_GRAPH = False
+SAMPLED_PT_PATH: Optional[str] = None
+MODE = "fp-growth"  # pattern-only | decision-tree | fp-growth
 #目标列
 #e0.interaction_label
 Y_KEY = "v0.high_degree"
@@ -168,7 +171,6 @@ def predicate_rule_to_zl(rule: Rule, frequent_pattern: FrequentPattern) -> ZLRul
 
 def main() -> None:
     print("=== GAR PPI Demo ===")
-    #TODO 输入采样后的图呢
     csv_path = resolve_csv_path(CSV_PATH, "protein_protein.csv")
     protein_csv_path = resolve_csv_path(PROTEIN_CSV_PATH, "protein.csv") if PROTEIN_CSV_PATH or AUTO_DISCOVER_IF_MISSING else None
     print(f"[Input] interaction_csv={csv_path}")
@@ -176,13 +178,25 @@ def main() -> None:
     print(f"[Config] mode={MODE} max_rows={MAX_ROWS} y_key={Y_KEY} min_value_support_count={MIN_VALUE_SUPPORT_COUNT}")
     print(f"[BN] pattern_bn={ENABLE_PATTERN_BN} predicate_bn={ENABLE_PREDICATE_BN}")
 
-    graph = load_ppi_csv(
-        csv_path,
-        max_rows=MAX_ROWS,
-        undirected=UNDIRECTED,
-        protein_path=protein_csv_path,
-        protein_index_column='index',
-    )
+    if USE_SAMPLED_PT_GRAPH:
+        if not SAMPLED_PT_PATH:
+            raise ValueError("USE_SAMPLED_PT_GRAPH=True but SAMPLED_PT_PATH is empty")
+        print(f"[Input] sampled_pt={SAMPLED_PT_PATH}")
+        graph = load_sampled_pt_graph(
+            SAMPLED_PT_PATH,
+            interaction_path=csv_path,
+            protein_path=protein_csv_path,
+            protein_index_column="index",
+            edge_label_column="Experimental System",
+        )
+    else:
+        graph = load_ppi_csv(
+            csv_path,
+            max_rows=MAX_ROWS,
+            undirected=UNDIRECTED,
+            protein_path=protein_csv_path,
+            protein_index_column='index',
+        )
     isolated_vertices = sum(1 for node_id in graph.vertices if not graph.out_edges.get(node_id) and not graph.in_edges.get(node_id))
     print(
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
@@ -210,7 +224,7 @@ def main() -> None:
             )
         )
 
-    seed = build_ppi_seed_pattern(graph)
+    seed = build_sampled_seed_pattern(graph) if USE_SAMPLED_PT_GRAPH else build_ppi_seed_pattern(graph)
     spawn = GraphSpawn(
         graph,
         [seed],
