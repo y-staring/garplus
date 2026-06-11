@@ -9,6 +9,7 @@ checkpoints/
 *.zip
 *.csv
 *.npz
+*.json
 logs/
 wandb/
 *.Identifier
@@ -28,3 +29,8 @@ experiments/exp1_accuracy/TI_test/data/noise/
 experiments/exp1_accuracy/PPI_test/data/noise/
 enumeration-discovery/data/
 enumeration-discovery/processed/
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
