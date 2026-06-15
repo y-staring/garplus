@@ -56,6 +56,19 @@ SELECTOR = "fps"
 # SELECTOR = "pickpatterns"
 TARGET_NUM = 2000
 
+# Raw subgraph construction mode.
+# - "vertex": original behavior; randomly sample k-hop neighborhoods around vertices.
+# - "signed_negative_aware": sample a mixed raw pool where part of subgraphs are
+#   centered on negative signed edges, then still use order embeddings + SELECTOR
+#   to pick representative subgraphs. This is the recommended mode for GAR+ ML
+#   refinement / negative-rule mining.
+SAMPLING_MODE = "signed_negative_aware"
+NEGATIVE_CENTER_RATIO = 0.5
+INCLUDE_POSITIVE_EDGE_CENTERS = True
+INTERACTION_LABEL_COL = "interaction_label"
+NEGATIVE_LABEL = "negative"
+POSITIVE_LABEL = "positive"
+
 DEFAULT_EDGE_CSV = os.path.join(BASE_DIR, "data", "protein_protein.csv")
 DEFAULT_NODE_CSV = os.path.join(BASE_DIR, "data", "node.csv")
 PROCESSED_DIR = os.path.join(BASE_DIR, "processed", "ppi")
@@ -102,13 +115,26 @@ class PickPatternPPIDataset(InMemoryDataset):
 
     def process(self):
         graph = build_ppi_graph(self.edge_csv, self.node_csv)
-        data_list = sample_k_hop_subgraphs(
-            graph=graph,
-            num_subgraphs=self.num_subgraphs,
-            min_nodes=self.min_nodes,
-            max_nodes=self.max_nodes,
-            k_hop=self.k_hop,
-        )
+        if SAMPLING_MODE == "signed_negative_aware":
+            data_list = sample_signed_k_hop_subgraphs(
+                graph=graph,
+                num_subgraphs=self.num_subgraphs,
+                min_nodes=self.min_nodes,
+                max_nodes=self.max_nodes,
+                k_hop=self.k_hop,
+                negative_center_ratio=NEGATIVE_CENTER_RATIO,
+                include_positive_edge_centers=INCLUDE_POSITIVE_EDGE_CENTERS,
+            )
+        elif SAMPLING_MODE == "vertex":
+            data_list = sample_k_hop_subgraphs(
+                graph=graph,
+                num_subgraphs=self.num_subgraphs,
+                min_nodes=self.min_nodes,
+                max_nodes=self.max_nodes,
+                k_hop=self.k_hop,
+            )
+        else:
+            raise ValueError(f"Unsupported SAMPLING_MODE: {SAMPLING_MODE}")
         if not data_list:
             raise RuntimeError("No sampled subgraphs were generated from the PPI graph.")
 
@@ -131,6 +157,8 @@ def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
     else:
         src_col, dst_col = "src", "dst"
     rel_col = "rel" if "rel" in df_edges.columns else None
+    label_col = INTERACTION_LABEL_COL if INTERACTION_LABEL_COL in df_edges.columns else None
+    experimental_system_col = "experimental system" if "experimental system" in df_edges.columns else None
 
     if src_col not in df_edges.columns or dst_col not in df_edges.columns:
         raise ValueError(
@@ -167,7 +195,9 @@ def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
         if valid_protein_nodes is not None:
             if src not in valid_protein_nodes or dst not in valid_protein_nodes:
                 continue
-        graph.add_edge(src, dst)
+        interaction_label = str(row[label_col]).strip().lower() if label_col is not None and pd.notna(row[label_col]) else "unknown"
+        experimental_system = str(row[experimental_system_col]).strip() if experimental_system_col is not None and pd.notna(row[experimental_system_col]) else "unknown"
+        graph.add_edge(src, dst, interaction_label=interaction_label, experimental_system=experimental_system)
 
     print(
         f"[Graph] Built PPI graph from protein-protein edges: "
@@ -176,16 +206,19 @@ def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
     return graph
 
 
-def graph_to_pyg(subgraph: nx.Graph, center_node: int) -> Data:
+def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None) -> Data:
     node_list = list(subgraph.nodes())
     node_to_idx = {node_id: idx for idx, node_id in enumerate(node_list)}
+    if center_nodes is None:
+        center_nodes = [center_node] if center_node is not None else []
+    center_node_set = set(center_nodes)
 
     degrees = np.array([subgraph.degree(node_id) for node_id in node_list], dtype=np.float32)
     clustering = np.array(
         [nx.clustering(subgraph, node_id) for node_id in node_list], dtype=np.float32
     )
     center_flag = np.array(
-        [1.0 if node_id == center_node else 0.0 for node_id in node_list], dtype=np.float32
+        [1.0 if node_id in center_node_set else 0.0 for node_id in node_list], dtype=np.float32
     )
 
     deg_max = float(degrees.max()) if len(degrees) else 1.0
@@ -198,9 +231,13 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int) -> Data:
     )
 
     directed_edges = []
-    for src, dst in subgraph.edges():
+    edge_labels = []
+    for src, dst, attrs in subgraph.edges(data=True):
+        label = str(attrs.get("interaction_label", "unknown")).strip().lower()
         directed_edges.append((node_to_idx[src], node_to_idx[dst]))
+        edge_labels.append(label)
         directed_edges.append((node_to_idx[dst], node_to_idx[src]))
+        edge_labels.append(label)
 
     edge_index = torch.tensor(directed_edges, dtype=torch.long).t().contiguous()
     num_nodes = len(node_list)
@@ -211,9 +248,15 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int) -> Data:
         n_nodes=torch.tensor([num_nodes], dtype=torch.long),
         y=torch.zeros(1, 0).float(),
     )
-    data.center_id = torch.tensor([node_to_idx[center_node]], dtype=torch.long)
+    if center_nodes:
+        center_indices = [node_to_idx[node_id] for node_id in center_nodes if node_id in node_to_idx]
+    else:
+        center_indices = []
+    data.center_id = torch.tensor(center_indices[:2] or [0], dtype=torch.long)
     data.orig_node_ids = torch.tensor(node_list, dtype=torch.long)
-    data.center_orig_id = torch.tensor([center_node], dtype=torch.long)
+    data.center_orig_id = torch.tensor(center_nodes[:2] if center_nodes else [node_list[0]], dtype=torch.long)
+    label_to_id = {NEGATIVE_LABEL: 1, POSITIVE_LABEL: 2, "unknown": 0}
+    data.edge_label = torch.tensor([label_to_id.get(label, 0) for label in edge_labels], dtype=torch.long)
     return data
 
 
@@ -273,6 +316,122 @@ def sample_k_hop_subgraphs(
 
     pbar.close()
     print(f"[Sample] Collected {len(subgraphs)} unique subgraphs after {attempts} attempts")
+    return subgraphs
+
+
+
+
+def _limited_edge_centered_subgraph(graph: nx.Graph, src: int, dst: int, k_hop: int, max_nodes: int) -> nx.Graph:
+    """Construct a bounded k-hop context around a signed center edge."""
+
+    src_ego = nx.ego_graph(graph, src, radius=k_hop, undirected=True)
+    dst_ego = nx.ego_graph(graph, dst, radius=k_hop, undirected=True)
+    node_candidates = []
+    seen = set()
+    for root in (src, dst):
+        for node_id in nx.bfs_tree(graph, source=root).nodes():
+            if node_id in src_ego or node_id in dst_ego:
+                if node_id not in seen:
+                    node_candidates.append(node_id)
+                    seen.add(node_id)
+            if len(node_candidates) >= max_nodes:
+                break
+        if len(node_candidates) >= max_nodes:
+            break
+    for endpoint in (src, dst):
+        if endpoint not in seen:
+            node_candidates.insert(0, endpoint)
+            seen.add(endpoint)
+    node_candidates = node_candidates[:max_nodes]
+    if src not in node_candidates or dst not in node_candidates:
+        node_candidates = [src, dst] + [node for node in node_candidates if node not in (src, dst)]
+        node_candidates = node_candidates[:max_nodes]
+    return graph.subgraph(node_candidates).copy()
+
+
+def _signed_edges(graph: nx.Graph, label: str):
+    """Return graph edges whose `interaction_label` matches label."""
+
+    return [
+        (src, dst)
+        for src, dst, attrs in graph.edges(data=True)
+        if str(attrs.get("interaction_label", "unknown")).strip().lower() == label
+    ]
+
+
+def sample_signed_k_hop_subgraphs(
+    graph: nx.Graph,
+    num_subgraphs: int,
+    min_nodes: int,
+    max_nodes: int,
+    k_hop: int,
+    negative_center_ratio: float = 0.5,
+    include_positive_edge_centers: bool = True,
+) -> List[Data]:
+    """Sample a raw pool with explicit negative-edge-centered subgraphs.
+
+    This keeps the later order-embedding selection unchanged, but ensures that
+    negative links enter the candidate pool with their k-hop context instead of
+    being appended later as isolated edges.
+    """
+
+    negative_edges = _signed_edges(graph, NEGATIVE_LABEL)
+    positive_edges = _signed_edges(graph, POSITIVE_LABEL)
+    nodes = list(graph.nodes())
+    if not nodes:
+        return []
+
+    negative_target = min(len(negative_edges), int(num_subgraphs * negative_center_ratio))
+    remaining_target = num_subgraphs - negative_target
+    print(
+        f"[SampleSigned] negative_edges={len(negative_edges)} positive_edges={len(positive_edges)} "
+        f"negative_target={negative_target} remaining_target={remaining_target}"
+    )
+
+    subgraphs: List[Data] = []
+    seen_signatures = set()
+
+    random.shuffle(negative_edges)
+    for src, dst in tqdm(negative_edges[:negative_target], desc="Sampling negative-centered", unit="subgraph"):
+        subgraph = _limited_edge_centered_subgraph(graph, src, dst, k_hop=k_hop, max_nodes=max_nodes)
+        if subgraph.number_of_nodes() < min_nodes or subgraph.number_of_edges() == 0:
+            continue
+        signature = ("neg", tuple(sorted(subgraph.nodes())), tuple(sorted((min(a, b), max(a, b)) for a, b in subgraph.edges())))
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        subgraphs.append(graph_to_pyg(subgraph, center_nodes=[src, dst]))
+
+    attempts = 0
+    max_attempts = max(num_subgraphs * 20, 1000)
+    pbar = tqdm(total=max(0, num_subgraphs - len(subgraphs)), desc="Sampling background", unit="subgraph")
+    while len(subgraphs) < num_subgraphs and attempts < max_attempts:
+        attempts += 1
+        if include_positive_edge_centers and positive_edges and random.random() < 0.5:
+            src, dst = random.choice(positive_edges)
+            ego = _limited_edge_centered_subgraph(graph, src, dst, k_hop=k_hop, max_nodes=max_nodes)
+            center_nodes = [src, dst]
+        else:
+            center = random.choice(nodes)
+            ego = nx.ego_graph(graph, center, radius=k_hop, undirected=True)
+            if ego.number_of_nodes() > max_nodes:
+                bfs_nodes = []
+                for node in nx.bfs_tree(ego, source=center).nodes():
+                    bfs_nodes.append(node)
+                    if len(bfs_nodes) >= max_nodes:
+                        break
+                ego = ego.subgraph(bfs_nodes).copy()
+            center_nodes = [center]
+        if ego.number_of_nodes() < min_nodes or ego.number_of_edges() == 0:
+            continue
+        signature = ("bg", tuple(sorted(ego.nodes())), tuple(sorted((min(a, b), max(a, b)) for a, b in ego.edges())))
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        subgraphs.append(graph_to_pyg(ego, center_nodes=center_nodes))
+        pbar.update(1)
+    pbar.close()
+    print(f"[SampleSigned] Collected {len(subgraphs)} signed-aware subgraphs")
     return subgraphs
 
 
@@ -430,6 +589,8 @@ def main():
             "selected_num_graphs": len(selected_graphs),
             "edge_csv": DEFAULT_EDGE_CSV,
             "k_hop": K_HOP,
+            "sampling_mode": SAMPLING_MODE,
+            "negative_center_ratio": NEGATIVE_CENTER_RATIO,
         },
         emb_path,
     )

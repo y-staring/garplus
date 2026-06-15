@@ -10,7 +10,7 @@ For one fixed frequent pattern we:
 """
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any
 
 from graph_types import DataGraph, FrequentPattern, instance_literals
@@ -30,8 +30,37 @@ class Rule:
 class PredicateTableMixin:
     """Shared utilities for converting matched instances into mining-ready rows."""
 
-    def __init__(self, min_value_support_count: int = 1) -> None:
+    def __init__(self, min_value_support_count: int = 1, drop_target_values: Optional[set] = None) -> None:
         self.min_value_support_count = max(1, int(min_value_support_count))
+        self.drop_target_values = set(drop_target_values or [])
+        self.diagnostics: List[Dict[str, object]] = []
+
+    def min_support_count(self, total_rows: int) -> int:
+        """Convert configured support threshold to paper-style absolute support."""
+
+        if self.min_support <= 1:
+            return max(1, int(total_rows * self.min_support))
+        return max(1, int(self.min_support))
+
+    def reset_diagnostics(self) -> None:
+        self.diagnostics = []
+
+    def record_diagnostic(self, antecedent: Tuple[str, ...], consequent: str, support: int, confidence: float, lift: float, reason: str) -> None:
+        self.diagnostics.append(
+            {
+                "antecedent": antecedent,
+                "consequent": consequent,
+                "support": support,
+                "confidence": confidence,
+                "lift": lift,
+                "reason": reason,
+            }
+        )
+
+    def negative_diagnostics(self, limit: int = 20) -> List[Dict[str, object]]:
+        rows = [item for item in self.diagnostics if str(item.get("consequent", "")).endswith("=negative")]
+        rows.sort(key=lambda item: (float(item["confidence"]), int(item["support"]), float(item["lift"])), reverse=True)
+        return rows[:limit]
 
     def build_instance_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern) -> List[Dict[str, object]]:
         """Convert all matched instances of one pattern into row dictionaries."""
@@ -53,6 +82,13 @@ class PredicateTableMixin:
             normalized = {key: ("|".join(str(v) for v in value) if isinstance(value, list) else value) for key, value in row.items()}
             rows.append(normalized)
         return rows
+
+    def filter_target_rows(self, rows: List[Dict[str, object]], y_key: str) -> List[Dict[str, object]]:
+        """Drop rows whose target value should not participate in rule mining."""
+
+        if not self.drop_target_values:
+            return rows
+        return [row for row in rows if row.get(y_key) not in self.drop_target_values]
 
     def prune_rows_by_value_support(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         """Drop low-support values first, then let empty columns disappear naturally."""
@@ -80,8 +116,8 @@ class PredicateTableMixin:
 class DecisionTreePredicateSelector(PredicateTableMixin):
     """A lightweight decision-tree-style selector."""
 
-    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None) -> None:
-        super().__init__(min_value_support_count=min_value_support_count)
+    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None, drop_target_values: Optional[set] = None) -> None:
+        super().__init__(min_value_support_count=min_value_support_count, drop_target_values=drop_target_values)
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
@@ -91,7 +127,8 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
 
         rows = self.build_instance_rows(graph, frequent_pattern)
         rows = self.prune_rows_by_value_support(rows)
-        return [row for row in rows if y_key in row]
+        rows = [row for row in rows if y_key in row]
+        return self.filter_target_rows(rows, y_key)
 
     def corr_analysis(self, rows: List[Dict[str, object]], y_key: str) -> List[str]:
         """A simple feature-screening heuristic based on equality rate to `y_key`."""
@@ -111,6 +148,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
     def generate_rules(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Rule]:
         """Generate simple `one antecedent -> one target` rules."""
 
+        self.reset_diagnostics()
         rows = self.generate_literal_df(graph, frequent_pattern, y_key)
         if not rows:
             return []
@@ -118,21 +156,36 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
             self.predicate_bn.fit_rows(rows, y_key)
             all_feature_keys = sorted({key for row in rows for key in row.keys() if key != y_key})
             candidate_keys = [key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)]
+            for dropped_key in sorted(set(all_feature_keys) - set(candidate_keys)):
+                for row in rows:
+                    if row.get(y_key) == "negative" and dropped_key in row:
+                        self.record_diagnostic((f"{dropped_key}={row[dropped_key]}",), f"{y_key}=negative", 0, 0.0, 0.0, "filtered_by_predicate_bn")
+                        break
         else:
             candidate_keys = self.corr_analysis(rows, y_key)
         if not candidate_keys:
             return []
         rules: List[Rule] = []
+        support_threshold = self.min_support_count(len(rows))
         for key in candidate_keys:
             grouped: Dict[Tuple[object, object], int] = Counter((row.get(key), row.get(y_key)) for row in rows)
             x_count = Counter(row.get(key) for row in rows)
             y_count = Counter(row.get(y_key) for row in rows)
             for (x_value, y_value), pair_count in grouped.items():
-                support = pair_count / len(rows)
+                support = pair_count
                 confidence = pair_count / x_count[x_value]
                 lift = confidence / (y_count[y_value] / len(rows))
-                if support >= self.min_support and confidence >= self.min_confidence:
-                    rules.append(Rule(antecedent=(f"{key}={x_value}",), consequent=f"{y_key}={y_value}", support=support, confidence=confidence, lift=lift))
+                consequent = f"{y_key}={y_value}"
+                antecedent = (f"{key}={x_value}",)
+                failed_reasons = []
+                if support < support_threshold:
+                    failed_reasons.append(f"support<{support_threshold}")
+                if confidence < self.min_confidence:
+                    failed_reasons.append(f"confidence<{self.min_confidence}")
+                if failed_reasons:
+                    self.record_diagnostic(antecedent, consequent, support, confidence, lift, ";".join(failed_reasons))
+                else:
+                    rules.append(Rule(antecedent=antecedent, consequent=consequent, support=support, confidence=confidence, lift=lift))
         if self.predicate_bn is not None:
             rules = self.predicate_bn.rank_rules(rules)
         return rules
@@ -141,8 +194,8 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
 class FPGrowthPredicateSelector(PredicateTableMixin):
     """A lightweight frequent-itemset selector."""
 
-    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None) -> None:
-        super().__init__(min_value_support_count=min_value_support_count)
+    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None, drop_target_values: Optional[set] = None) -> None:
+        super().__init__(min_value_support_count=min_value_support_count, drop_target_values=drop_target_values)
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
@@ -185,11 +238,19 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
     def generate_rules(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_prefix: str) -> List[Rule]:
         """Emit association rules whose consequent belongs to the requested target prefix."""
 
+        self.reset_diagnostics()
         rows = self.prune_rows_by_value_support(self.build_instance_rows(graph, frequent_pattern))
+        rows = [row for row in rows if y_prefix in row]
+        rows = self.filter_target_rows(rows, y_prefix)
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_prefix)
             all_feature_keys = sorted({key for row in rows for key in row.keys() if key != y_prefix})
             kept_feature_keys = {key for _, key in self.predicate_bn.rank_feature_keys(rows, all_feature_keys)}
+            for dropped_key in sorted(set(all_feature_keys) - set(kept_feature_keys)):
+                for row in rows:
+                    if row.get(y_prefix) == "negative" and dropped_key in row:
+                        self.record_diagnostic((f"{dropped_key}={row[dropped_key]}",), f"{y_prefix}=negative", 0, 0.0, 0.0, "filtered_by_predicate_bn")
+                        break
         else:
             kept_feature_keys = None
         transactions: List[List[str]] = []
@@ -202,6 +263,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
                 transactions.append(sorted(set(transaction)))
         itemsets = self.frequent_itemsets(transactions)
         total = len(transactions) or 1
+        support_threshold = self.min_support_count(total)
         single_counts = {items[0]: count for items, count in itemsets.items() if len(items) == 1}
         rules: List[Rule] = []
         for items, itemset_count in itemsets.items():
@@ -217,10 +279,18 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
                 antecedent_count = single_counts.get(antecedent_items[0], itemset_count) if len(antecedent_items) == 1 else itemsets.get(tuple(sorted(antecedent_items)), itemset_count)
                 consequent_count = single_counts.get(consequent, itemset_count)
                 confidence = itemset_count / antecedent_count
-                support = itemset_count / total
+                support = itemset_count
                 lift = confidence / (consequent_count / total)
-                if support >= self.min_support and confidence >= self.min_confidence:
-                    rules.append(Rule(antecedent=tuple(sorted(antecedent_items)), consequent=consequent, support=support, confidence=confidence, lift=lift))
+                antecedent = tuple(sorted(antecedent_items))
+                failed_reasons = []
+                if support < support_threshold:
+                    failed_reasons.append(f"support<{support_threshold}")
+                if confidence < self.min_confidence:
+                    failed_reasons.append(f"confidence<{self.min_confidence}")
+                if failed_reasons:
+                    self.record_diagnostic(antecedent, consequent, support, confidence, lift, ";".join(failed_reasons))
+                else:
+                    rules.append(Rule(antecedent=antecedent, consequent=consequent, support=support, confidence=confidence, lift=lift))
         unique = {}
         for rule in rules:
             unique[(rule.antecedent, rule.consequent)] = rule

@@ -27,33 +27,37 @@ from rulegeneration import (
 # =========================
 # PPI demo fixed config
 # =========================
-CSV_PATH: Optional[str] = r"D:\CodeWork\python\GAR+\数据\去病图数据\去病图数据\protein_protein.csv"
-PROTEIN_CSV_PATH: Optional[str] = r"D:\CodeWork\python\GAR+\数据\去病图数据\去病图数据\protein.csv"
+CSV_PATH: Optional[str] = r"/home/yyyy/codework/GARplus/enumeration-discovery/去病图数据/protein_protein_signed.csv"
+PROTEIN_CSV_PATH: Optional[str] = r"/home/yyyy/codework/GARplus/enumeration-discovery/去病图数据/protein.csv"
 AUTO_DISCOVER_IF_MISSING = False
-USE_SAMPLED_PT_GRAPH = False
-SAMPLED_PT_PATH: Optional[str] = None
-MODE = "fp-growth"  # pattern-only | decision-tree | fp-growth
+USE_SAMPLED_PT_GRAPH = True
+SAMPLED_PT_PATH: Optional[str] = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/ppi/ppi_selected.pt"
+FORCE_EDGE_LABEL = "candidate_interaction"
+AUGMENT_NEGATIVE_EDGES = True
+NEGATIVE_EDGE_LIMIT = 2000
+BALANCE_EDGE_LABELS = True
+MODE = "decision-tree"  # pattern-only | decision-tree | fp-growth
 #目标列
 #e0.interaction_label
-Y_KEY = "v0.high_degree"
+Y_KEY = "e0.interaction_label"
 MAX_ROWS = 50
 UNDIRECTED = True
 FULL_SOLUTION = False
 
 PATTERN_SUPPORT = 5
-MIN_SUPPORT = 0.1
-MIN_CONFIDENCE = 0.6
-MIN_VALUE_SUPPORT_COUNT = 5
-MAX_RADIUS = 2
-MAX_ADD_EDGE = 2
+MIN_SUPPORT = 100
+MIN_CONFIDENCE = 0.3
+MIN_VALUE_SUPPORT_COUNT =20
+MAX_RADIUS = 1
+MAX_ADD_EDGE = 1
 NODE_MAX_ADD_EDGE = 1
-MAX_MULTI_SUPPORT = 5000
+MAX_MULTI_SUPPORT = 10000
 PRINT_RULE_LIMIT = 10
 PRINT_FULL_PAYLOAD = False
 PRINT_INSTANCES = False
 PRINT_INSTANCE_LIMIT = 5
 PRINT_BN_STATS = True
-
+DROP_UNKNOWN_TARGET_ROWS = True
 ENABLE_PATTERN_BN = True
 PATTERN_BN_TOP_K_PER_SPAWN_NODE = 8
 PATTERN_BN_MIN_SCORE = 0.0
@@ -122,9 +126,117 @@ def print_bn_summary(pattern_bn, predicate_bn) -> None:
             f"pruned={summary['features_pruned']} rules_ranked={summary['rules_ranked']}"
         )
         print(f"  target_values={summary['target_values']}")
+        print(
+            f"  target_cardinality={summary.get('target_cardinality')} "
+            f"estimated_target_cpd_cells={summary.get('estimated_target_cpd_cells')} "
+            f"max_cpd_cells={summary.get('max_cpd_cells')}"
+        )
+        print(
+            f"  sparse_candidates={summary.get('candidate_features_after_sparse_filter')} "
+            f"sparse_skipped={summary.get('sparse_features_skipped')} "
+            f"skip_reasons={summary.get('sparse_skip_reasons')}"
+        )
+        if summary.get("skipped_cpd_budget"):
+            print(f"  skipped_cpd_budget={summary.get('skipped_cpd_budget')}")
         for score, key in summary["top_features"]:
             print(f"  predicate_bn_top score={score:.6f} feature={key}")
 
+
+
+def print_interaction_label_distribution(graph) -> None:
+    counts = {}
+    for edge in graph.all_edges():
+        label = edge.attrs.get("interaction_label", "<missing>")
+        counts[label] = counts.get(label, 0) + 1
+    if counts:
+        print(f"[Graph] interaction_label_distribution={counts}")
+
+
+
+
+def print_rule_consequent_distribution(rules: List[Rule]) -> None:
+    counts = {}
+    for rule in rules:
+        value = rule.consequent.split("=", 1)[1] if "=" in rule.consequent else rule.consequent
+        counts[value] = counts.get(value, 0) + 1
+    print(f"[PredicateSelection] consequent_distribution={counts}")
+
+def print_interaction_label_distribution(graph) -> None:
+    counts = {}
+    for edge in graph.all_edges():
+        label = edge.attrs.get("interaction_label", "<missing>")
+        counts[label] = counts.get(label, 0) + 1
+    if counts:
+        print(f"[Graph] interaction_label_distribution={counts}")
+
+
+
+
+
+def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
+    diagnostics = selector.negative_diagnostics(limit=limit) if hasattr(selector, "negative_diagnostics") else []
+    if not diagnostics:
+        print("[PredicateSelection] negative_candidate_diagnostics=[]")
+        return
+    print(f"[PredicateSelection] negative_candidate_diagnostics top={len(diagnostics)}")
+    for item in diagnostics:
+        print(
+            "  negative_candidate "
+            f"antecedent={item['antecedent']} consequent={item['consequent']} "
+            f"support={item['support']} confidence={item['confidence']:.4f} "
+            f"lift={item['lift']:.4f} reason={item['reason']}"
+        )
+
+
+def _rule_matches_row(rule: Rule, row: dict) -> bool:
+    for antecedent in rule.antecedent:
+        key, value = antecedent.split("=", 1)
+        if str(row.get(key)) != value:
+            return False
+    return True
+
+
+def _instance_edge_identity(instance, pattern_edge_index: int = 0):
+    edge_id = instance.get_edge_id(pattern_edge_index)
+    if edge_id is not None:
+        return ("edge_id", edge_id)
+    if instance.edge_ids:
+        return ("edge_tuple", instance.edge_ids[pattern_edge_index if pattern_edge_index < len(instance.edge_ids) else 0])
+    return ("instance", tuple(sorted(instance.node_map.items())))
+
+
+def evaluate_negative_rule_recall(selector, graph, frequent_pattern: FrequentPattern, rules: List[Rule], y_key: str, negative_value: str = "negative") -> dict:
+    rows = selector.prune_rows_by_value_support(selector.build_instance_rows(graph, frequent_pattern))
+    rows = [row for row in rows if y_key in row]
+    rows = selector.filter_target_rows(rows, y_key)
+    negative_rules = [rule for rule in rules if rule.consequent == f"{y_key}={negative_value}"]
+    negative_edges = set()
+    covered_edges = set()
+    covered_instances = 0
+    negative_instances = 0
+    for index, row in enumerate(rows):
+        if str(row.get(y_key)) != negative_value:
+            continue
+        negative_instances += 1
+        if index >= len(frequent_pattern.instances):
+            edge_identity = ("row", index)
+        else:
+            edge_identity = _instance_edge_identity(frequent_pattern.instances[index])
+        negative_edges.add(edge_identity)
+        if any(_rule_matches_row(rule, row) for rule in negative_rules):
+            covered_instances += 1
+            covered_edges.add(edge_identity)
+    denominator = len(negative_edges)
+    covered = len(covered_edges)
+    return {
+        "negative_rules": len(negative_rules),
+        "negative_instances": negative_instances,
+        "covered_negative_instances": covered_instances,
+        "total_negative_edges": denominator,
+        "covered_negative_edges": covered,
+        "edge_recall": covered / denominator if denominator else 0.0,
+        "instance_recall": covered_instances / negative_instances if negative_instances else 0.0,
+    }
 
 def predicate_rule_to_zl(rule: Rule, frequent_pattern: FrequentPattern) -> ZLRule:
     general_keys = []
@@ -136,6 +248,11 @@ def predicate_rule_to_zl(rule: Rule, frequent_pattern: FrequentPattern) -> ZLRul
         values.append([value])
         semantics.append("or")
     y_key, _ = rule.consequent.split("=", 1)
+    # `rule.support` follows the paper definition now: |Q(G, X ? p0)|.
+    # Do not multiply it by pattern support again.
+    xy_support = max(0, int(rule.support))
+    xy_support_single = min(frequent_pattern.single_support(), xy_support)
+    xy_support_multiple = min(frequent_pattern.multi_support(), xy_support)
     segment = SegmentRuleSet(
         keys=[y_key],
         intervals=[(float("-inf"), float("inf"))],
@@ -143,8 +260,8 @@ def predicate_rule_to_zl(rule: Rule, frequent_pattern: FrequentPattern) -> ZLRul
         statistics=RuleStatistics(
             freq_antecedent=FreqCount(frequent_pattern.single_support(), frequent_pattern.multi_support()),
             freq_union=FreqCount(
-                max(1, int(rule.support * frequent_pattern.single_support())),
-                max(1, int(rule.support * frequent_pattern.multi_support())),
+                xy_support_single,
+                xy_support_multiple,
             ),
             confidence=rule.confidence,
             lift=rule.lift,
@@ -188,6 +305,11 @@ def main() -> None:
             protein_path=protein_csv_path,
             protein_index_column="index",
             edge_label_column="Experimental System",
+            force_edge_label=FORCE_EDGE_LABEL,
+            augment_negative_edges=AUGMENT_NEGATIVE_EDGES,
+            negative_edge_limit=NEGATIVE_EDGE_LIMIT,
+            interaction_label_column="interaction_label",
+            balance_edge_labels=BALANCE_EDGE_LABELS,
         )
     else:
         graph = load_ppi_csv(
@@ -202,6 +324,7 @@ def main() -> None:
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
         f"isolated_vertices={isolated_vertices}"
     )
+    print_interaction_label_distribution(graph)
 
     pattern_bn = None
     if ENABLE_PATTERN_BN:
@@ -251,18 +374,31 @@ def main() -> None:
         return
 
     if MODE == "decision-tree":
-        selector = DecisionTreePredicateSelector(min_support=MIN_SUPPORT, min_confidence=MIN_CONFIDENCE, min_value_support_count=MIN_VALUE_SUPPORT_COUNT, predicate_bn=predicate_bn)
+        selector = DecisionTreePredicateSelector(min_support=MIN_SUPPORT, min_confidence=MIN_CONFIDENCE, min_value_support_count=MIN_VALUE_SUPPORT_COUNT, predicate_bn=predicate_bn, drop_target_values={"unknown"} if DROP_UNKNOWN_TARGET_ROWS else None)
         rules = selector.generate_rules(graph, target_pattern, Y_KEY)
         print(f"[PredicateSelection/DecisionTree] rules={len(rules)} y_key={Y_KEY}")
+        active_selector = selector
     elif MODE == "fp-growth":
-        selector = FPGrowthPredicateSelector(min_support=MIN_SUPPORT, min_confidence=MIN_CONFIDENCE, min_value_support_count=MIN_VALUE_SUPPORT_COUNT, predicate_bn=predicate_bn)
+        selector = FPGrowthPredicateSelector(min_support=MIN_SUPPORT, min_confidence=MIN_CONFIDENCE, min_value_support_count=MIN_VALUE_SUPPORT_COUNT, predicate_bn=predicate_bn, drop_target_values={"unknown"} if DROP_UNKNOWN_TARGET_ROWS else None)
         rules = selector.generate_rules(graph, target_pattern, Y_KEY)
         print(f"[PredicateSelection/FPGrowth] rules={len(rules)} y_prefix={Y_KEY}")
+        active_selector = selector
     else:
         raise ValueError(f"Unsupported MODE: {MODE}")
 
+    print_rule_consequent_distribution(rules)
+    print_negative_rule_diagnostics(active_selector)
+    negative_recall = evaluate_negative_rule_recall(active_selector, graph, target_pattern, rules, Y_KEY)
+    print(
+        "[NegativeRecall] "
+        f"negative_rules={negative_recall['negative_rules']} "
+        f"covered_edges={negative_recall['covered_negative_edges']}/{negative_recall['total_negative_edges']} "
+        f"edge_recall={negative_recall['edge_recall']:.4f} "
+        f"covered_instances={negative_recall['covered_negative_instances']}/{negative_recall['negative_instances']} "
+        f"instance_recall={negative_recall['instance_recall']:.4f}"
+    )
     for rule in rules[:PRINT_RULE_LIMIT]:
-        print(f"  antecedent={rule.antecedent} consequent={rule.consequent} conf={rule.confidence:.3f} lift={rule.lift:.3f}")
+        print(f"  antecedent={rule.antecedent} consequent={rule.consequent} support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}")
     print_bn_summary(pattern_bn, predicate_bn)
 
     if not rules:
@@ -292,3 +428,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

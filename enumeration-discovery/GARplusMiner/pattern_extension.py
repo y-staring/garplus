@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Any
 
 from graph_types import DataGraph, EdgePattern, FrequentPattern, GraphPattern, PatternEdge, PatternOptions, SpawnEdge, derive_edge_types
-from vf3_like import find_matches_with_limit
-
+# from vf3_like import find_matches_with_limit
+from vf3_linux import find_matches_with_limit
 
 @dataclass
 class SpawnStats:

@@ -24,14 +24,14 @@ from networkx.algorithms.isomorphism import GraphMatcher
 
 
 # ==============================================================================
-# Order-Embedding 模型与算法
+# Order-Embedding 妯″瀷涓庣畻娉?
 # ==============================================================================
 
 class GraphOrderEncoder(nn.Module):
     """
-    子图 -> graph embedding
+    瀛愬浘 -> graph embedding
     GIN + global pooling
-    输出非负 embedding，适合 order relation
+    杈撳嚭闈炶礋 embedding锛岄€傚悎 order relation
     """
     def __init__(self, in_dim, hidden_dim=128, emb_dim=64, num_layers=3):
         super().__init__()
@@ -77,8 +77,8 @@ def order_energy(z_small, z_large):
 
 def order_embedding_loss(z1, z2, y, margin=1.0):
     """
-    y=1: z1 对应图是 z2 的子图
-    y=0: 不满足子图关系
+    y=1: z1 瀵瑰簲鍥炬槸 z2 鐨勫瓙鍥?
+    y=0: 涓嶆弧瓒冲瓙鍥惧叧绯?
     """
     e = order_energy(z1, z2)
     pos_loss = y * e
@@ -88,7 +88,7 @@ def order_embedding_loss(z1, z2, y, margin=1.0):
 
 def induced_subgraph_by_node_drop(data, keep_ratio=0.7, min_nodes=3):
     """
-    从一个 PyG Data 中随机删点，生成真正的正样本 A ⊆ B
+    浠庝竴涓?PyG Data 涓殢鏈哄垹鐐癸紝鐢熸垚鐪熸鐨勬鏍锋湰 A 鈯?B
     """
     num_nodes = data.num_nodes
     keep_num = max(min_nodes, int(num_nodes * keep_ratio))
@@ -149,6 +149,9 @@ def induced_subgraph_by_node_drop(data, keep_ratio=0.7, min_nodes=3):
     if hasattr(data, "edge_attr") and data.edge_attr is not None:
         new_data.edge_attr = data.edge_attr[kept_eids]
 
+    if hasattr(data, "edge_label") and data.edge_label is not None:
+        new_data.edge_label = data.edge_label[kept_eids]
+
     if hasattr(data, "edge_label_mask") and data.edge_label_mask is not None:
         new_data.edge_label_mask = data.edge_label_mask[kept_eids]
 
@@ -157,9 +160,9 @@ def induced_subgraph_by_node_drop(data, keep_ratio=0.7, min_nodes=3):
 
 class OrderPairDataset(Dataset):
     """
-    动态构造训练对:
-      正样本: (small_subgraph, original_graph, 1)
-      负样本: (random_graph_i, random_graph_j, 0)
+    鍔ㄦ€佹瀯閫犺缁冨:
+      姝ｆ牱鏈? (small_subgraph, original_graph, 1)
+      璐熸牱鏈? (random_graph_i, random_graph_j, 0)
     """
     def __init__(self, graph_list, pos_ratio=0.5, min_keep=0.5, max_keep=0.9):
         self.graph_list = graph_list
@@ -196,10 +199,18 @@ class OrderPairDataset(Dataset):
         return self.graph_list[idx], self.graph_list[j], torch.tensor(0.0)
 
 
+def _ensure_edge_label(data):
+    if hasattr(data, "edge_label") and data.edge_label is not None:
+        return data
+    edge_num = data.edge_index.size(1) if getattr(data, "edge_index", None) is not None else 0
+    data.edge_label = torch.zeros(edge_num, dtype=torch.long)
+    return data
+
+
 def order_collate_fn(batch):
     g1_list, g2_list, y_list = zip(*batch)
-    b1 = Batch.from_data_list(list(g1_list))
-    b2 = Batch.from_data_list(list(g2_list))
+    b1 = Batch.from_data_list([_ensure_edge_label(data) for data in g1_list])
+    b2 = Batch.from_data_list([_ensure_edge_label(data) for data in g2_list])
     y = torch.stack(list(y_list), dim=0).float()
     return b1, b2, y
 
@@ -318,8 +329,8 @@ def embedding_volume(e, eps=1e-8):
 
 # def compute_thresholds(embs, sigma, chi=1.0):
 #     """
-#     Threshold[i] = 第 i 维 top-(chi*sigma) 大值中的最小值
-#     论文要求 chi in [0,1]
+#     Threshold[i] = 绗?i 缁?top-(chi*sigma) 澶у€间腑鐨勬渶灏忓€?
+#     璁烘枃瑕佹眰 chi in [0,1]
 #     """
 #     embs = np.asarray(embs, dtype=np.float32)
 #     n, d = embs.shape
@@ -340,19 +351,19 @@ def embedding_volume(e, eps=1e-8):
 import heapq
 def compute_thresholds(embs, sigma, chi=1.0):
     """
-    按论文思路计算 Threshold[i]:
-    Threshold[i] = 第 i 维 top-(chi*sigma) 大值中的最小值
+    鎸夎鏂囨€濊矾璁＄畻 Threshold[i]:
+    Threshold[i] = 绗?i 缁?top-(chi*sigma) 澶у€间腑鐨勬渶灏忓€?
 
-    参数
+    鍙傛暟
     ----
     embs : array-like, shape (n, d)
-        所有 embedding
+        鎵€鏈?embedding
     sigma : int
-        论文中的 sigma
+        璁烘枃涓殑 sigma
     chi : float, default=1.0
-        论文中的 chi, 通常 in [0, 1]
+        璁烘枃涓殑 chi, 閫氬父 in [0, 1]
 
-    返回
+    杩斿洖
     ----
     thresholds : np.ndarray, shape (d,)
     """
@@ -364,27 +375,27 @@ def compute_thresholds(embs, sigma, chi=1.0):
     if not (0 < chi <= 1.0):
         raise ValueError(f"chi should be in (0,1], got {chi}")
 
-    # 这里沿用你之前的实现约定：ceil(chi * sigma)
+    # 杩欓噷娌跨敤浣犱箣鍓嶇殑瀹炵幇绾﹀畾锛歝eil(chi * sigma)
     m = max(1, min(n, int(math.ceil(chi * sigma))))
 
     thresholds = np.zeros(d, dtype=np.float32)
 
-    # 对每一维维护一个大小最多为 m 的最小堆
-    # 堆里始终保存“当前 top-m 大值”
+    # 瀵规瘡涓€缁寸淮鎶や竴涓ぇ灏忔渶澶氫负 m 鐨勬渶灏忓爢
+    # 鍫嗛噷濮嬬粓淇濆瓨鈥滃綋鍓?top-m 澶у€尖€?
     for i in range(d):
         heap = []
 
         for e in embs:
             ai = float(e[i])
 
-            # (i) 若 |S_th^i| < m，则直接加入
+            # (i) 鑻?|S_th^i| < m锛屽垯鐩存帴鍔犲叆
             if len(heap) < m:
                 heapq.heappush(heap, ai)
-            # 否则若 ai > Threshold[i]（也就是当前堆顶最小值），替换之
+            # 鍚﹀垯鑻?ai > Threshold[i]锛堜篃灏辨槸褰撳墠鍫嗛《鏈€灏忓€硷級锛屾浛鎹箣
             elif ai > heap[0]:
                 heapq.heapreplace(heap, ai)
 
-        # (ii) Threshold[i] 定义为 S_th^i 中最小值
+        # (ii) Threshold[i] 瀹氫箟涓?S_th^i 涓渶灏忓€?
         thresholds[i] = heap[0]
 
     return thresholds
@@ -581,7 +592,7 @@ def pick_patterns(
           f"median={np.median(thresholds):.6f}")
     print(f"[Step3] first-{min(debug_topk, len(thresholds))} thresholds = {thresholds[:debug_topk]}")
 
-    # 看 embedding 相对 threshold 的关系
+    # 鐪?embedding 鐩稿 threshold 鐨勫叧绯?
     num_all_above = 0
     num_all_below = 0
     num_partial = 0
@@ -695,3 +706,4 @@ def sanity_check_order(model, graph_list, num_trials=10, device=None):
             ok += 1
 
     print(f"[Sanity] pass rate: {ok}/{max(total,1)}")
+

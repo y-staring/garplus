@@ -4,14 +4,11 @@ from __future__ import annotations
 
 For every frequent pattern, matched instances are flattened into rows. The
 configured target key, e.g. `e0.interaction_label`, becomes the BN target node.
-All other literal columns become predicate feature nodes pointing to the target:
-
-    feature_1 -> target <- feature_2 <- ...
-
-The learned pgmpy CPDs are used to rank/prune predicate columns and to rank final
-rules. This keeps the existing rule miners, but makes candidate selection BN-led.
+Feature columns are filtered before fitting so sparse ID-like attributes do not
+explode the discrete CPD size.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -29,7 +26,32 @@ class PredicateBNConfig:
     estimator: str = "bayesian"  # bayesian | maximum_likelihood
     equivalent_sample_size: float = 5.0
     drop_target_from_antecedent: bool = True
-    max_parent_features: int = 12
+    max_parent_features: int = 4
+    max_feature_cardinality: int = 32
+    max_unique_ratio: float = 0.25
+    min_non_missing_count: int = 20
+    min_mode_count: int = 2
+    max_cpd_cells: int = 200_000
+    excluded_key_tokens: Tuple[str, ...] = (
+        "id",
+        "index",
+        "accession",
+        "biogrid",
+        "entrez",
+        "uniprot",
+        "refseq",
+        "sequence",
+        "comments",
+    )
+
+
+@dataclass
+class FeatureStats:
+    count: int
+    cardinality: int
+    unique_ratio: float
+    mode_count: int
+    reason: str = ""
 
 
 class PredicateBayesianNetwork:
@@ -49,6 +71,11 @@ class PredicateBayesianNetwork:
         self.last_rule_count = 0
         self.trained = False
         self.training_feature_count = 0
+        self.target_cardinality = 0
+        self.estimated_target_cpd_cells = 0
+        self.filtered_feature_stats: Dict[str, FeatureStats] = {}
+        self.skipped_feature_stats: Dict[str, FeatureStats] = {}
+        self.skipped_feature_budget: Dict[str, int] = {}
 
     @staticmethod
     def literal_item(key: str, value: object) -> str:
@@ -66,7 +93,7 @@ class PredicateBayesianNetwork:
         y_key = self.config.target_key
         pd, model_cls, estimator_cls = _load_pgmpy(self.config.estimator)
         clean_rows: List[Dict[str, str]] = []
-        feature_counts: Dict[str, int] = {}
+        feature_values: Dict[str, Counter] = {}
         target_counts: Dict[str, int] = {}
         for row in rows:
             if y_key not in row:
@@ -74,29 +101,31 @@ class PredicateBayesianNetwork:
             clean_row: Dict[str, str] = {y_key: str(row[y_key])}
             target_counts[f"{y_key}={row[y_key]}"] = target_counts.get(f"{y_key}={row[y_key]}", 0) + 1
             for key, value in row.items():
-                if key == y_key and self.config.drop_target_from_antecedent:
-                    continue
                 if key == y_key:
                     continue
-                clean_row[key] = str(value)
-                feature_counts[key] = feature_counts.get(key, 0) + 1
+                clean_value = str(value)
+                clean_row[key] = clean_value
+                feature_values.setdefault(key, Counter())[clean_value] += 1
             clean_rows.append(clean_row)
         if not clean_rows:
-            self.model = None
-            self.data = None
-            self.feature_columns = []
-            self.row_count = 0
-            self.target_counts = {}
-            self.trained = False
-            self.training_feature_count = 0
+            self._reset_empty()
             return self
 
-        ranked_features = sorted(feature_counts, key=feature_counts.get, reverse=True)
-        self.feature_columns = ranked_features[: max(0, self.config.max_parent_features)]
+        self.row_count = len(clean_rows)
+        self.target_counts = target_counts
+        self.target_cardinality = max(1, len({row[y_key] for row in clean_rows}))
+        self.filtered_feature_stats, self.skipped_feature_stats = self._filter_sparse_features(feature_values)
+        ranked_features = sorted(
+            self.filtered_feature_stats,
+            key=lambda key: (
+                -self.filtered_feature_stats[key].count,
+                self.filtered_feature_stats[key].cardinality,
+                key,
+            ),
+        )
+        self.feature_columns = self._select_budgeted_parent_features(ranked_features)
         selected_columns = [y_key] + self.feature_columns
         self.data = pd.DataFrame([{column: row.get(column, "__MISSING__") for column in selected_columns} for row in clean_rows]).astype(str)
-        self.row_count = len(self.data)
-        self.target_counts = target_counts
         self.training_feature_count = len(self.feature_columns)
         if not self.feature_columns:
             self.model = model_cls([])
@@ -114,6 +143,68 @@ class PredicateBayesianNetwork:
             )
         self.trained = True
         return self
+
+    def _reset_empty(self) -> None:
+        self.model = None
+        self.data = None
+        self.feature_columns = []
+        self.row_count = 0
+        self.target_counts = {}
+        self.trained = False
+        self.training_feature_count = 0
+        self.target_cardinality = 0
+        self.estimated_target_cpd_cells = 0
+        self.filtered_feature_stats = {}
+        self.skipped_feature_stats = {}
+        self.skipped_feature_budget = {}
+
+    def _filter_sparse_features(self, feature_values: Dict[str, Counter]) -> Tuple[Dict[str, FeatureStats], Dict[str, FeatureStats]]:
+        kept: Dict[str, FeatureStats] = {}
+        skipped: Dict[str, FeatureStats] = {}
+        for key, counts in feature_values.items():
+            count = sum(counts.values())
+            cardinality = len(counts)
+            mode_count = max(counts.values()) if counts else 0
+            unique_ratio = cardinality / max(count, 1)
+            reason = self._skip_reason(key, count, cardinality, unique_ratio, mode_count)
+            stats = FeatureStats(count=count, cardinality=cardinality, unique_ratio=unique_ratio, mode_count=mode_count, reason=reason)
+            if reason:
+                skipped[key] = stats
+            else:
+                kept[key] = stats
+        return kept, skipped
+
+    def _skip_reason(self, key: str, count: int, cardinality: int, unique_ratio: float, mode_count: int) -> str:
+        key_tail = key.split(".", 1)[-1].lower()
+        if any(token in key_tail for token in self.config.excluded_key_tokens):
+            return "excluded_key_token"
+        if count < self.config.min_non_missing_count:
+            return f"non_missing<{self.config.min_non_missing_count}"
+        if cardinality > self.config.max_feature_cardinality:
+            return f"cardinality>{self.config.max_feature_cardinality}"
+        if unique_ratio > self.config.max_unique_ratio:
+            return f"unique_ratio>{self.config.max_unique_ratio}"
+        if mode_count < self.config.min_mode_count:
+            return f"mode_count<{self.config.min_mode_count}"
+        return ""
+
+    def _select_budgeted_parent_features(self, ranked_features: Sequence[str]) -> List[str]:
+        selected: List[str] = []
+        self.skipped_feature_budget = {}
+        parent_state_product = 1
+        max_parents = max(0, self.config.max_parent_features)
+        for feature in ranked_features:
+            cardinality = max(1, self.filtered_feature_stats[feature].cardinality)
+            estimated_cells = self.target_cardinality * parent_state_product * cardinality
+            if estimated_cells > self.config.max_cpd_cells:
+                self.skipped_feature_budget[feature] = estimated_cells
+                continue
+            selected.append(feature)
+            parent_state_product *= cardinality
+            if len(selected) >= max_parents:
+                break
+        self.estimated_target_cpd_cells = self.target_cardinality * parent_state_product
+        return selected
 
     def score_item_for_target(self, item: str, target_item: Optional[str] = None) -> float:
         """Score one feature literal using pgmpy target CPD probability."""
@@ -151,14 +242,15 @@ class PredicateBayesianNetwork:
     def rank_feature_keys(self, rows: Sequence[Dict[str, object]], feature_keys: Iterable[str]) -> List[Tuple[float, str]]:
         """Rank and optionally prune feature columns through pgmpy CPDs."""
 
-        feature_list = list(feature_keys)
+        original_feature_list = list(feature_keys)
+        feature_list = [key for key in original_feature_list if key in self.feature_columns]
         scored = [(self.score_feature_key(rows, key), key) for key in feature_list]
         scored = [item for item in scored if item[0] >= self.config.min_score]
         scored.sort(key=lambda item: item[0], reverse=True)
         if self.config.top_k_features is not None:
             scored = scored[: max(0, self.config.top_k_features)]
         self.total_feature_rank_calls += 1
-        self.total_features_seen += len(feature_list)
+        self.total_features_seen += len(original_feature_list)
         self.total_features_kept += len(scored)
         self.last_feature_snapshot = scored[:8]
         return scored
@@ -180,16 +272,24 @@ class PredicateBayesianNetwork:
     def pruning_summary(self) -> Dict[str, object]:
         """Return observable Predicate-BN pruning/ranking statistics."""
 
+        skipped_by_reason = Counter(stats.reason for stats in self.skipped_feature_stats.values())
         return {
             "backend": "pgmpy",
             "rows": self.row_count,
             "trained": self.trained,
             "training_feature_count": self.training_feature_count,
+            "target_cardinality": self.target_cardinality,
+            "estimated_target_cpd_cells": self.estimated_target_cpd_cells,
+            "max_cpd_cells": self.config.max_cpd_cells,
             "target_values": dict(self.target_counts),
             "feature_rank_calls": self.total_feature_rank_calls,
             "features_seen": self.total_features_seen,
             "features_kept": self.total_features_kept,
             "features_pruned": self.total_features_seen - self.total_features_kept,
+            "candidate_features_after_sparse_filter": len(self.filtered_feature_stats),
+            "sparse_features_skipped": len(self.skipped_feature_stats),
+            "sparse_skip_reasons": dict(skipped_by_reason),
+            "skipped_cpd_budget": dict(list(self.skipped_feature_budget.items())[:8]),
             "rules_ranked": self.last_rule_count,
             "top_features": self.last_feature_snapshot,
         }
