@@ -1,4 +1,5 @@
 ﻿import os
+import argparse
 import random
 import sys
 from typing import List
@@ -9,7 +10,7 @@ import pandas as pd
 import torch
 from torch_geometric.data import Batch, Data, InMemoryDataset
 from tqdm import tqdm
-
+from collections import Counter
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 BASE_DIR = os.path.dirname(CURRENT_DIR)
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
@@ -69,14 +70,68 @@ INTERACTION_LABEL_COL = "interaction_label"
 NEGATIVE_LABEL = "negative"
 POSITIVE_LABEL = "positive"
 
-DEFAULT_EDGE_CSV = os.path.join(BASE_DIR, "data", "protein_protein.csv")
-DEFAULT_NODE_CSV = os.path.join(BASE_DIR, "data", "node.csv")
-PROCESSED_DIR = os.path.join(BASE_DIR, "processed", "ppi")
+SIGNED_DATA_DIR = r"/home/yyyy/codework/GARplus/enumeration-discovery/去病图数据"
+DEFAULT_RELATION = os.environ.get("GARPLUS_SAMPLING_RELATION", "ppi").strip().lower()
 
-ENCODER_FILENAME = "ppi_order_encoder.pt"
-EMB_FILENAME = "ppi_train_embeddings.pt"
-RAW_FILENAME = "ppi_raw.pt"
-SELECTED_FILENAME = "ppi_selected.pt"
+RELATION_CONFIGS = {
+    "ppi": {
+        "name": "PPI",
+        "edge_csv": os.path.join(SIGNED_DATA_DIR, "protein_protein_signed.csv"),
+        "node_csv": os.path.join(SIGNED_DATA_DIR, "protein.csv"),
+        "node_csvs": [
+            {"path": os.path.join(SIGNED_DATA_DIR, "protein.csv"), "node_type": "Protein", "id_offset": 0},
+        ],
+        "processed_dir": os.path.join(BASE_DIR, "processed", "ppi"),
+        "src_dst_candidates": [
+            ("index_a", "index_b"),
+            ("entrez gene interactor a", "entrez gene interactor b"),
+            ("x_index", "y_index"),
+            ("src", "dst"),
+        ],
+    },
+    "dda": {
+        "name": "DDA",
+        "edge_csv": os.path.join(SIGNED_DATA_DIR, "drug_disease_signed.csv"),
+        "node_csv": None,
+        "node_csvs": [
+            {"path": os.path.join(SIGNED_DATA_DIR, "drug.csv"), "node_type": "Drug", "id_offset": 0},
+            {"path": os.path.join(SIGNED_DATA_DIR, "disease.csv"), "node_type": "Disease", "id_offset": 1000000000},
+        ],
+        "processed_dir": os.path.join(BASE_DIR, "processed", "dda"),
+        "src_dst_candidates": [
+            ("chemical_index", "disease_index"),
+            ("src", "dst"),
+        ],
+        "dst_node_offset": 1000000000,
+    },
+    "ti": {
+        "name": "TI",
+        "edge_csv": os.path.join(SIGNED_DATA_DIR, "gene_disease_signed.csv"),
+        "node_csv": None,
+        "node_csvs": [
+            {"path": os.path.join(SIGNED_DATA_DIR, "gene.csv"), "node_type": "Gene", "id_offset": 0},
+            {"path": os.path.join(SIGNED_DATA_DIR, "disease.csv"), "node_type": "Disease", "id_offset": 1000000000},
+        ],
+        "processed_dir": os.path.join(BASE_DIR, "processed", "ti"),
+        "src_dst_candidates": [
+            ("gene_index", "disease_index"),
+            ("src", "dst"),
+        ],
+        "dst_node_offset": 1000000000,
+    },
+}
+
+if DEFAULT_RELATION not in RELATION_CONFIGS:
+    raise ValueError(f"Unsupported GARPLUS_SAMPLING_RELATION={DEFAULT_RELATION!r}")
+
+DEFAULT_EDGE_CSV = RELATION_CONFIGS[DEFAULT_RELATION]["edge_csv"]
+DEFAULT_NODE_CSV = RELATION_CONFIGS[DEFAULT_RELATION]["node_csv"]
+PROCESSED_DIR = RELATION_CONFIGS[DEFAULT_RELATION]["processed_dir"]
+
+ENCODER_FILENAME = f"{DEFAULT_RELATION}_order_encoder.pt"
+EMB_FILENAME = f"{DEFAULT_RELATION}_train_embeddings.pt"
+RAW_FILENAME = f"{DEFAULT_RELATION}_raw.pt"
+SELECTED_FILENAME = f"{DEFAULT_RELATION}_selected.pt"
 
 
 class PickPatternPPIDataset(InMemoryDataset):
@@ -89,6 +144,8 @@ class PickPatternPPIDataset(InMemoryDataset):
         min_nodes=5,
         max_nodes=10,
         k_hop=2,
+        relation_config=None,
+        raw_filename=RAW_FILENAME,
     ):
         self.edge_csv = edge_csv
         self.node_csv = node_csv
@@ -96,6 +153,8 @@ class PickPatternPPIDataset(InMemoryDataset):
         self.min_nodes = min_nodes
         self.max_nodes = max_nodes
         self.k_hop = k_hop
+        self.relation_config = relation_config or RELATION_CONFIGS[DEFAULT_RELATION]
+        self.raw_filename = raw_filename
         super().__init__(root)
 
         load_path = self.processed_paths[0]
@@ -108,13 +167,13 @@ class PickPatternPPIDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return [RAW_FILENAME]
+        return [self.raw_filename]
 
     def download(self):
         return
 
     def process(self):
-        graph = build_ppi_graph(self.edge_csv, self.node_csv)
+        graph = build_signed_graph(self.edge_csv, self.node_csv, self.relation_config)
         if SAMPLING_MODE == "signed_negative_aware":
             data_list = sample_signed_k_hop_subgraphs(
                 graph=graph,
@@ -136,75 +195,125 @@ class PickPatternPPIDataset(InMemoryDataset):
         else:
             raise ValueError(f"Unsupported SAMPLING_MODE: {SAMPLING_MODE}")
         if not data_list:
-            raise RuntimeError("No sampled subgraphs were generated from the PPI graph.")
+            raise RuntimeError("No sampled subgraphs were generated from the signed graph.")
 
         data, slices = self.collate(data_list)
         torch.save((data, slices), self.processed_paths[0])
         print(f"[Done] Saved RAW sampled pool: {len(data_list)} -> {self.processed_paths[0]}")
 
 
-def build_ppi_graph(edge_csv: str, node_csv: str = None) -> nx.Graph:
+def _find_src_dst_columns(df_edges: pd.DataFrame, candidates) -> tuple:
+    for src_col, dst_col in candidates:
+        if src_col in df_edges.columns and dst_col in df_edges.columns:
+            return src_col, dst_col
+    raise ValueError(
+        f"Expected one of src/dst column pairs {candidates}, got {list(df_edges.columns)}"
+    )
+
+
+def _merge_signed_label(old_label: str, new_label: str) -> str:
+    priority = {NEGATIVE_LABEL: 3, POSITIVE_LABEL: 2, "neutral": 1, "unknown": 0}
+    old_label = str(old_label or "unknown").strip().lower()
+    new_label = str(new_label or "unknown").strip().lower()
+    return new_label if priority.get(new_label, 0) > priority.get(old_label, 0) else old_label
+
+
+def build_signed_graph(edge_csv: str, node_csv: str = None, relation_config=None) -> nx.Graph:
     if not os.path.exists(edge_csv):
         raise FileNotFoundError(f"Edge CSV not found: {edge_csv}")
 
+    relation_config = relation_config or RELATION_CONFIGS[DEFAULT_RELATION]
+    relation_name = relation_config.get("name", "signed")
+    dst_node_offset = int(relation_config.get("dst_node_offset", 0) or 0)
     df_edges = pd.read_csv(edge_csv)
     df_edges.columns = [str(c).strip().lower() for c in df_edges.columns]
 
-    if "index_a" in df_edges.columns and "index_b" in df_edges.columns:
-        src_col, dst_col = "index_a", "index_b"
-    elif "x_index" in df_edges.columns and "y_index" in df_edges.columns:
-        src_col, dst_col = "x_index", "y_index"
-    else:
-        src_col, dst_col = "src", "dst"
+    src_col, dst_col = _find_src_dst_columns(
+        df_edges,
+        relation_config.get("src_dst_candidates", [("src", "dst")]),
+    )
     rel_col = "rel" if "rel" in df_edges.columns else None
     label_col = INTERACTION_LABEL_COL if INTERACTION_LABEL_COL in df_edges.columns else None
+    edge_label_col = "edgelabel" if "edgelabel" in df_edges.columns else None
     experimental_system_col = "experimental system" if "experimental system" in df_edges.columns else None
 
-    if src_col not in df_edges.columns or dst_col not in df_edges.columns:
-        raise ValueError(
-            f"Expected src/dst, x_index/y_index, or index_A/index_B columns in {edge_csv}, got {list(df_edges.columns)}"
-        )
-
-    if rel_col is not None:
+    if rel_col is not None and relation_name.upper() == "PPI":
         rel_series = df_edges[rel_col].astype(str).str.strip().str.lower()
         df_edges = df_edges[rel_series.isin(["protein_protein", "protein-protein"])].copy()
 
     graph = nx.Graph()
-    valid_protein_nodes = None
-    if node_csv and os.path.exists(node_csv):
-        df_nodes = pd.read_csv(node_csv)
-        df_nodes.columns = [str(c).strip().lower() for c in df_nodes.columns]
-        if "node_type" in df_nodes.columns:
-            df_nodes = df_nodes[df_nodes["node_type"].astype(str).str.lower() == "protein"].copy()
-        if "node_index" in df_nodes.columns:
-            node_id_col = "node_index"
-        elif "node_id" in df_nodes.columns:
-            node_id_col = "node_id"
-        else:
-            node_id_col = df_nodes.columns[0]
-        valid_protein_nodes = set(int(node_id) for node_id in df_nodes[node_id_col].tolist())
-        for node_id in valid_protein_nodes:
-            graph.add_node(node_id)
-        print(f"[Graph] Protein-only node filter enabled: {len(valid_protein_nodes)} protein nodes")
+    valid_nodes = None
+    node_sources = []
+    if node_csv:
+        node_sources = [{"path": node_csv, "node_type": relation_name, "id_offset": 0}]
+    else:
+        node_sources = list(relation_config.get("node_csvs", []))
+
+    if node_sources:
+        valid_nodes = set()
+        for source in node_sources:
+            source_path = source.get("path")
+            if not source_path or not os.path.exists(source_path):
+                continue
+            df_nodes = pd.read_csv(source_path)
+            df_nodes.columns = [str(c).strip().lower() for c in df_nodes.columns]
+            if "node_type" in df_nodes.columns and relation_name.upper() == "PPI":
+                df_nodes = df_nodes[df_nodes["node_type"].astype(str).str.lower() == "protein"].copy()
+            if "node_index" in df_nodes.columns:
+                node_id_col = "node_index"
+            elif "node_id" in df_nodes.columns:
+                node_id_col = "node_id"
+            elif "index" in df_nodes.columns:
+                node_id_col = "index"
+            else:
+                node_id_col = df_nodes.columns[0]
+            id_offset = int(source.get("id_offset", 0) or 0)
+            node_type = source.get("node_type", relation_name)
+            count = 0
+            for raw_node_id in df_nodes[node_id_col].dropna().tolist():
+                node_id = int(raw_node_id) + id_offset
+                graph.add_node(node_id, node_type=node_type, source_node_id=int(raw_node_id))
+                valid_nodes.add(node_id)
+                count += 1
+            print(f"[Graph] Node file loaded: type={node_type} path={source_path} nodes={count} offset={id_offset}")
 
     for _, row in df_edges.iterrows():
+        if pd.isna(row[src_col]) or pd.isna(row[dst_col]):
+            continue
         src = int(row[src_col])
-        dst = int(row[dst_col])
+        dst = int(row[dst_col]) + dst_node_offset
         if src == dst:
             continue
-        if valid_protein_nodes is not None:
-            if src not in valid_protein_nodes or dst not in valid_protein_nodes:
+        if valid_nodes is not None:
+            if src not in valid_nodes or dst not in valid_nodes:
                 continue
         interaction_label = str(row[label_col]).strip().lower() if label_col is not None and pd.notna(row[label_col]) else "unknown"
-        experimental_system = str(row[experimental_system_col]).strip() if experimental_system_col is not None and pd.notna(row[experimental_system_col]) else "unknown"
-        graph.add_edge(src, dst, interaction_label=interaction_label, experimental_system=experimental_system)
+        edge_type = str(row[edge_label_col]).strip() if edge_label_col is not None and pd.notna(row[edge_label_col]) else relation_name
+        experimental_system = str(row[experimental_system_col]).strip() if experimental_system_col is not None and pd.notna(row[experimental_system_col]) else edge_type
+        if graph.has_edge(src, dst):
+            old_label = graph[src][dst].get("interaction_label", "unknown")
+            graph[src][dst]["interaction_label"] = _merge_signed_label(old_label, interaction_label)
+            graph[src][dst]["edge_multiplicity"] = int(graph[src][dst].get("edge_multiplicity", 1)) + 1
+        else:
+            graph.add_edge(
+                src,
+                dst,
+                interaction_label=interaction_label,
+                experimental_system=experimental_system,
+                edge_type=edge_type,
+                edge_multiplicity=1,
+            )
 
+    label_counts = Counter(
+        str(attrs.get("interaction_label", "unknown")).strip().lower()
+        for _, _, attrs in graph.edges(data=True)
+    )
     print(
-        f"[Graph] Built PPI graph from protein-protein edges: "
-        f"{graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
+        f"[Graph] Built {relation_name} graph from signed edges: "
+        f"{graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges, "
+        f"labels={dict(label_counts)}"
     )
     return graph
-
 
 def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None) -> Data:
     node_list = list(subgraph.nodes())
@@ -255,7 +364,7 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None)
     data.center_id = torch.tensor(center_indices[:2] or [0], dtype=torch.long)
     data.orig_node_ids = torch.tensor(node_list, dtype=torch.long)
     data.center_orig_id = torch.tensor(center_nodes[:2] if center_nodes else [node_list[0]], dtype=torch.long)
-    label_to_id = {NEGATIVE_LABEL: 1, POSITIVE_LABEL: 2, "unknown": 0}
+    label_to_id = {NEGATIVE_LABEL: 1, POSITIVE_LABEL: 2, "neutral": 3, "unknown": 0}
     data.edge_label = torch.tensor([label_to_id.get(label, 0) for label in edge_labels], dtype=torch.long)
     return data
 
@@ -491,21 +600,46 @@ def sanity_check_order(model, graph_list, num_trials=10):
     print(f"[Sanity] pass rate: {ok}/{max(total, 1)}")
 
 
-def main():
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Signed-aware GAR+ subgraph sampling for PPI, DDA, and TI.")
+    parser.add_argument("--relation", choices=sorted(RELATION_CONFIGS), default=DEFAULT_RELATION)
+    parser.add_argument("--edge-csv", default=None)
+    parser.add_argument("--node-csv", default=None)
+    parser.add_argument("--processed-dir", default=None)
+    parser.add_argument("--target-num", type=int, default=TARGET_NUM)
+    parser.add_argument("--raw-num-subgraphs", type=int, default=RAW_NUM_SUBGRAPHS)
+    return parser.parse_args(argv)
 
-    encoder_path = os.path.join(PROCESSED_DIR, ENCODER_FILENAME)
-    emb_path = os.path.join(PROCESSED_DIR, EMB_FILENAME)
-    selected_path = os.path.join(PROCESSED_DIR, SELECTED_FILENAME)
+
+def main(argv=None):
+    args = parse_args(argv)
+    relation = args.relation.strip().lower()
+    relation_config = dict(RELATION_CONFIGS[relation])
+    edge_csv = args.edge_csv or relation_config["edge_csv"]
+    node_csv = args.node_csv if args.node_csv is not None else relation_config.get("node_csv")
+    processed_dir = args.processed_dir or relation_config["processed_dir"]
+    encoder_filename = f"{relation}_order_encoder.pt"
+    emb_filename = f"{relation}_train_embeddings.pt"
+    raw_filename = f"{relation}_raw.pt"
+    selected_filename = f"{relation}_selected.pt"
+
+    os.makedirs(processed_dir, exist_ok=True)
+
+    print(f"[Config] relation={relation} edge_csv={edge_csv} node_csv={node_csv}")
+    encoder_path = os.path.join(processed_dir, encoder_filename)
+    emb_path = os.path.join(processed_dir, emb_filename)
+    selected_path = os.path.join(processed_dir, selected_filename)
 
     raw_dataset = PickPatternPPIDataset(
-        root=PROCESSED_DIR,
-        edge_csv=DEFAULT_EDGE_CSV,
-        node_csv=DEFAULT_NODE_CSV,
-        num_subgraphs=RAW_NUM_SUBGRAPHS,
+        root=processed_dir,
+        edge_csv=edge_csv,
+        node_csv=node_csv,
+        num_subgraphs=args.raw_num_subgraphs,
         min_nodes=RAW_MIN_NODES,
         max_nodes=RAW_MAX_NODES,
         k_hop=K_HOP,
+        relation_config=relation_config,
+        raw_filename=raw_filename,
     )
 
     data_list = load_data_list_from_inmemory(raw_dataset)
@@ -564,7 +698,7 @@ def main():
     selected_idx = select_graphs(
         embs=embs_np,
         method=SELECTOR,
-        k=TARGET_NUM,
+        k=args.target_num,
         seed=seed,
         sigma=PICK_SIGMA,
         chi=PICK_CHI,
@@ -587,7 +721,8 @@ def main():
             "pick_chi": PICK_CHI,
             "raw_num_graphs": len(data_list),
             "selected_num_graphs": len(selected_graphs),
-            "edge_csv": DEFAULT_EDGE_CSV,
+            "edge_csv": edge_csv,
+            "relation": relation,
             "k_hop": K_HOP,
             "sampling_mode": SAMPLING_MODE,
             "negative_center_ratio": NEGATIVE_CENTER_RATIO,
@@ -603,4 +738,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 

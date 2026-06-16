@@ -134,6 +134,17 @@ class GraphPattern:
     def canonical_code(self) -> Tuple[Tuple[Label, ...], Tuple[Tuple[int, int, Label], ...]]:
         return tuple(self.node_labels), self.edge_signature()
 
+    def undirected_canonical_code(self) -> Tuple[Tuple[Label, ...], Tuple[Tuple[Tuple[Label, int], Tuple[Label, int], Label], ...]]:
+        """Canonical signature that treats edge direction as irrelevant."""
+
+        edges = []
+        for edge in self.edges:
+            left = (self.node_labels[edge.src], min(edge.src, edge.dst))
+            right = (self.node_labels[edge.dst], max(edge.src, edge.dst))
+            if str(left) > str(right):
+                left, right = right, left
+            edges.append((left, right, edge.label))
+        return tuple(self.node_labels), tuple(sorted(edges, key=str))
     def has_edge(self, src: int, dst: int, label: Label) -> bool:
         return any(edge.src == src and edge.dst == dst and edge.label == label for edge in self.edges)
 
@@ -236,6 +247,7 @@ class PatternOptions:
     timeout_seconds: int = 1
     timeout_vf3_seconds: int = 15
     parallel_edge: bool = True
+    undirected_pattern: bool = False
 
 
 @dataclass
@@ -308,3 +320,7 @@ def derive_edge_types(data_graph: DataGraph) -> Dict[Label, List[EdgePattern]]:
         for edge in edges:
             bucket.add(EdgePattern(edge_label=edge.label, target_label=data_graph.vertices[edge.src].label, direction="in"))
     return {label: sorted(list(edges), key=lambda x: (str(x.direction), str(x.edge_label), str(x.target_label))) for label, edges in result.items()}
+
+
+
+

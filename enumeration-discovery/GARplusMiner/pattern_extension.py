@@ -41,7 +41,7 @@ class GraphSpawn:
 
     def __post_init__(self) -> None:
         for item in self.pattern_set:
-            self._known_codes.add(item.pattern.canonical_code())
+            self._known_codes.add(_pattern_code(item.pattern, getattr(self.options, "undirected_pattern", False)))
             if item.pattern.pattern_id < 0:
                 item.pattern.pattern_id = self._request_pattern_id()
 
@@ -83,6 +83,20 @@ class GraphSpawn:
         self.spawn_radius += 1
         return generated
 
+
+def _pattern_code(pattern: GraphPattern, undirected: bool):
+    if undirected and hasattr(pattern, "undirected_canonical_code"):
+        return pattern.undirected_canonical_code()
+    if undirected:
+        edges = []
+        for edge in pattern.edges:
+            left = (pattern.node_labels[edge.src], min(edge.src, edge.dst))
+            right = (pattern.node_labels[edge.dst], max(edge.src, edge.dst))
+            if str(left) > str(right):
+                left, right = right, left
+            edges.append((left, right, edge.label))
+        return tuple(pattern.node_labels), tuple(sorted(edges, key=str))
+    return pattern.canonical_code()
 
 def get_spawn_nodes(pattern: GraphPattern, spawn_radius: int, node_max_add_edge: int, max_add_edge: int) -> List[int]:
     """Choose which pattern nodes may still spawn new edges at this radius."""
@@ -160,7 +174,7 @@ class GraphSpawner:
 
         grown_pattern = pattern_grow(base.pattern, spawn_edge)
         grown_pattern.refresh_radius()
-        code = grown_pattern.canonical_code()
+        code = _pattern_code(grown_pattern, self.options.undirected_pattern)
         if code in self.known_codes:
             return None
         if not check_add_edge_constraints(grown_pattern, self.options):
@@ -245,3 +259,4 @@ def check_add_edge_constraints(pattern: GraphPattern, options: PatternOptions) -
         radius_edge_count[radii[edge.src]] += 1
         radius_edge_count[radii[edge.dst]] += 1
     return all(count <= options.max_add_edge for count in radius_edge_count.values())
+
