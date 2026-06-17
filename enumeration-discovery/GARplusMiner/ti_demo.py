@@ -26,7 +26,7 @@ RELATION = RelationGraphConfig(
     edge_csv_path=str(DATA_DIR / "gene_disease_signed.csv"),
     source_node_csv_path=str(DATA_DIR / "gene.csv"),
     target_node_csv_path=str(DATA_DIR / "disease.csv"),
-    load_node_attributes=False,
+    load_node_attributes=True,
 )
 
 
@@ -43,11 +43,20 @@ CONFIG = GarplusRunConfig(
     force_edge_label="gene_disease",
     edge_label_column="EdgeLabel",
     pattern_bn_cache_path=str(PROCESSED_DIR / "ti" / "pattern_bn.pkl"),
+    predicate_bn_focus_targets=("negative", "positive"),
     predicate_bn_cache_path=str(PROCESSED_DIR / "ti" / "predicate_bn_negative.pkl"),
+    deduped_rules_output_path=str(PROCESSED_DIR / "ti" / "deduped_rules.txt"),
+    include_ml_predicate_targets=False,
+    filter_degree_predicates=True,
+    ignored_predicate_key_tokens=("degree", "high_degree", "sampled_", "augmented_negative", "direction_role", "edgelabel", "ml_equivalence"),
+    ignored_target_values=("unknown", "neutral"),
+    drop_ignored_target_edges=True,
     ml_predicates=MLPredicateConfig(
         enabled=True,
         equivalence_threshold=0.95,
         similarity_threshold=0.80,
+        precomputed_edge_csv_path="/home/yyyy/codework/GARplus/enumeration-discovery/GARplusMiner/GARplus-ml-predicate/gene_disease_signed.csv",
+        offline_csv_path=str(PROCESSED_DIR / "ti" / "ml_predicates.csv"),
     ),
 )
 
@@ -60,3 +69,5 @@ if __name__ == "__main__":
     start_time = time.time()
     main()
     print("running cost:", time.time() - start_time)
+
+

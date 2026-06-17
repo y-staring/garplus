@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,16 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from graph_types import DataGraph, FrequentPattern, GraphInstance, GraphPattern, Vertex
 from ppi_loader import _assign_degree_features, _edge_attrs_from_row, _merge_vertex, _normalize_edge_label, _normalize_key, _normalize_scalar
 from sampled_pt_loader import _balance_edges_by_label, _extract_data_and_slices, _iter_sampled_graph_records, _load_torch_object
+
+
+def _raise_csv_field_limit() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
 
 
 DISEASE_NODE_OFFSET = 1_000_000_000
@@ -41,20 +52,21 @@ def _node_kind(orig_id: int, cfg: RelationGraphConfig) -> Tuple[str, int]:
     return cfg.source_label, orig_id
 
 
-def _load_node_attrs(path: Optional[str], label: str, offset: int = 0) -> Dict[int, Vertex]:
+def _load_node_attrs(path: Optional[str], label: str, index_column: str = "index", offset: int = 0) -> Dict[int, Vertex]:
+    _raise_csv_field_limit()
     result: Dict[int, Vertex] = {}
     if not path or not Path(path).exists():
         return result
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            raw_id = _normalize_scalar(row.get("index"))
+            raw_id = _normalize_scalar(row.get(index_column))
             if raw_id is None:
                 continue
             node_id = int(raw_id) + offset
             attrs = {}
             for column, value in row.items():
-                if column == "index":
+                if column == index_column:
                     continue
                 normalized = _normalize_scalar(value)
                 if normalized is not None:
@@ -66,12 +78,30 @@ def _load_node_attrs(path: Optional[str], label: str, offset: int = 0) -> Dict[i
 def _load_relation_node_attrs(cfg: RelationGraphConfig) -> Dict[int, Vertex]:
     if not cfg.load_node_attributes:
         return {}
-    attrs = _load_node_attrs(cfg.source_node_csv_path, cfg.source_label, offset=0)
-    attrs.update(_load_node_attrs(cfg.target_node_csv_path, cfg.target_label, offset=cfg.target_node_offset))
+    source_attrs = _load_node_attrs(
+        cfg.source_node_csv_path,
+        cfg.source_label,
+        index_column=cfg.source_index_column,
+        offset=0,
+    )
+    target_attrs = _load_node_attrs(
+        cfg.target_node_csv_path,
+        cfg.target_label,
+        index_column=cfg.target_index_column,
+        offset=cfg.target_node_offset,
+    )
+    attrs = dict(source_attrs)
+    attrs.update(target_attrs)
+    print(
+        f"[NodeAttrs/{cfg.relation_name}] "
+        f"source={len(source_attrs)} path={cfg.source_node_csv_path} index={cfg.source_index_column} "
+        f"target={len(target_attrs)} path={cfg.target_node_csv_path} index={cfg.target_index_column}"
+    )
     return attrs
 
 
 def _load_edge_lookup(path: str, cfg: RelationGraphConfig, force_edge_label: Optional[str]) -> Dict[Tuple[int, int], Tuple[str, Dict[str, object]]]:
+    _raise_csv_field_limit()
     lookup: Dict[Tuple[int, int], Tuple[str, Dict[str, object]]] = {}
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -102,6 +132,7 @@ def _append_negative_edges(
 ) -> int:
     if limit <= 0:
         return 0
+    _raise_csv_field_limit()
     existing_pairs = {
         (int(attrs.get("sampled_src_original_id", -1)), int(attrs.get("sampled_dst_original_id", -1)))
         for _, _, _, attrs in pending_edges
@@ -264,3 +295,5 @@ def build_source_seed_pattern(graph: DataGraph, source_label: str) -> FrequentPa
         if vertex.label == source_label
     ]
     return FrequentPattern(pattern=pattern, instances=instances)
+
+

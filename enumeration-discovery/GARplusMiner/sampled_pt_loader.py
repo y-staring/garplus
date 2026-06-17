@@ -226,6 +226,38 @@ def _ensure_augmented_vertex(vertices: Dict[int, Vertex], orig_id: int, protein_
         _merge_vertex(vertex, protein_attrs[orig_id])
     vertices[graph_node_id] = vertex
 
+def _build_original_to_graph_nodes(vertices: Dict[int, Vertex]) -> Dict[int, List[int]]:
+    """Build original protein id -> existing graph node ids."""
+
+    mapping: Dict[int, List[int]] = {}
+    for graph_node_id, vertex in vertices.items():
+        orig_id = vertex.attrs.get("original_index")
+        if orig_id is None:
+            continue
+        try:
+            orig_id = int(orig_id)
+        except Exception:
+            continue
+        mapping.setdefault(orig_id, []).append(graph_node_id)
+    return mapping
+
+
+def _same_sampled_graph_pair(
+    vertices: Dict[int, Vertex],
+    left_nodes: List[int],
+    right_nodes: List[int],
+) -> Optional[Tuple[int, int]]:
+    """Prefer endpoints that occur in the same sampled subgraph."""
+
+    for src_node in left_nodes:
+        src_gid = vertices[src_node].attrs.get("sampled_graph_id")
+        for dst_node in right_nodes:
+            if src_node == dst_node:
+                continue
+            dst_gid = vertices[dst_node].attrs.get("sampled_graph_id")
+            if src_gid == dst_gid:
+                return src_node, dst_node
+    return None
 
 def _append_negative_edges(
     vertices: Dict[int, Vertex],
@@ -278,6 +310,99 @@ def _append_negative_edges(
         if added >= negative_edge_limit:
             break
     return added
+# def _append_negative_edges(
+#     vertices: Dict[int, Vertex],
+#     pending_edges: List[Tuple[int, int, str, Dict[str, object]]],
+#     protein_attrs: Dict[int, Vertex],
+#     interaction_path: Optional[str],
+#     edge_label_column: str,
+#     force_edge_label: Optional[str],
+#     negative_edge_limit: int,
+#     label_column: str = "interaction_label",
+#     negative_value: str = "negative",
+# ) -> int:
+#     """Append negative signed CSV edges into the sampled mining graph.
+
+#     Important:
+#     - Do not create new isolated endpoints for negative edges.
+#     - Only add a negative edge when both original endpoints already appear
+#       in the sampled graph.
+#     - Prefer endpoints that occur in the same sampled subgraph.
+#     """
+
+#     if negative_edge_limit <= 0:
+#         return 0
+
+#     original_to_nodes = _build_original_to_graph_nodes(vertices)
+
+#     existing_original_pairs = {
+#         (
+#             int(attrs.get("sampled_src_original_id", -1)),
+#             int(attrs.get("sampled_dst_original_id", -1)),
+#         )
+#         for _, _, _, attrs in pending_edges
+#     }
+
+#     existing_graph_pairs = {
+#         (src, dst)
+#         for src, dst, _, _ in pending_edges
+#     }
+
+#     added = 0
+
+#     for row_index, left, right, label, attrs, row in _iter_signed_rows(
+#         interaction_path,
+#         label_column=label_column,
+#     ):
+#         if label != negative_value:
+#             continue
+
+#         if (left, right) in existing_original_pairs:
+#             continue
+
+#         left_nodes = original_to_nodes.get(left, [])
+#         right_nodes = original_to_nodes.get(right, [])
+
+#         # 核心修改：两个端点必须已经在采样图中
+#         if not left_nodes or not right_nodes:
+#             continue
+
+#         pair = _same_sampled_graph_pair(vertices, left_nodes, right_nodes)
+
+#         # 如果两个端点没有出现在同一个 sampled subgraph 中，就跳过
+#         # 这样可以避免人为把两个不相关的 ego graph 连起来
+#         if pair is None:
+#             continue
+
+#         src_node, dst_node = pair
+
+#         if (src_node, dst_node) in existing_graph_pairs:
+#             continue
+
+#         edge_label = force_edge_label or _normalize_edge_label(
+#             row.get(edge_label_column, "negative_interaction")
+#         )
+
+#         edge_attrs = dict(attrs)
+#         edge_attrs.setdefault(label_column, negative_value)
+#         edge_attrs.setdefault("sampled_graph_id", vertices[src_node].attrs.get("sampled_graph_id"))
+#         edge_attrs.setdefault("augmented_negative_edge", "yes")
+#         edge_attrs.setdefault("negative_attach_mode", "reuse_existing_sampled_nodes")
+#         edge_attrs.setdefault("sampled_src_original_id", left)
+#         edge_attrs.setdefault("sampled_dst_original_id", right)
+#         edge_attrs.setdefault("sampled_src_local_id", src_node)
+#         edge_attrs.setdefault("sampled_dst_local_id", dst_node)
+
+#         pending_edges.append((src_node, dst_node, edge_label, edge_attrs))
+
+#         existing_original_pairs.add((left, right))
+#         existing_graph_pairs.add((src_node, dst_node))
+
+#         added += 1
+#         if added >= negative_edge_limit:
+#             break
+
+#     return added
 
 
 def _assign_sampled_node_features(graph: DataGraph, data, local_to_orig: Dict[int, int]) -> None:
@@ -428,6 +553,7 @@ def load_sampled_pt_graph(
         before_counts = Counter(str(attrs.get(interaction_label_column, "unknown")).strip().lower() for _, _, _, attrs in pending_edges)
         pending_edges = _balance_edges_by_label(pending_edges, label_column=interaction_label_column)
         print(f"[SampledPT] balanced_edge_label_counts={dict(before_counts)}")
+        print(f"[SampledPT] augmented_negative_edges_reused_existing_nodes={added_negative}")
 
     graph = DataGraph(vertices=vertices)
     for graph_src, graph_dst, edge_label, attrs in pending_edges:

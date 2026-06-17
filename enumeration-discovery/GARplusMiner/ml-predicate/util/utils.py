@@ -82,20 +82,6 @@ def object_text(obj: Object, fields: Sequence[str], *, max_chars: int = 900) -> 
     return ". ".join(parts)[:max_chars]
 
 
-def lexical_scores(text_pairs: Sequence[tuple[str, str]]) -> list[float]:
-    """Cheap token-overlap fallback when embedding dependencies are unavailable."""
-
-    scores: list[float] = []
-    for left, right in text_pairs:
-        left_tokens = set(re.findall(r"[A-Za-z0-9_]+", clean_text(left, lower=True)))
-        right_tokens = set(re.findall(r"[A-Za-z0-9_]+", clean_text(right, lower=True)))
-        if not left_tokens or not right_tokens:
-            scores.append(0.0)
-        else:
-            scores.append(len(left_tokens & right_tokens) / len(left_tokens | right_tokens))
-    return scores
-
-
 def validate_pairs(pairs: Sequence[ObjectPair]) -> None:
     for index, pair in enumerate(pairs):
         if len(pair) != 2:

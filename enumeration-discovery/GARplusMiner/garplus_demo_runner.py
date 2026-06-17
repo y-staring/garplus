@@ -5,8 +5,9 @@ from pathlib import Path
 from pprint import pprint
 from typing import Callable, List, Optional
 
-from graph_types import FrequentPattern, PatternOptions
+from graph_types import DataGraph, FrequentPattern, PatternOptions
 from garplus_ml_predicates import MLPredicateConfig, inject_ml_predicates
+from predicate_enrichment import PredicateEnrichmentConfig, enrich_numeric_bin_predicates
 from pattern_bn import PatternBayesianNetwork, PatternBNConfig
 from pattern_extension import GraphSpawn
 from predicate_bn import PredicateBayesianNetwork, PredicateBNConfig
@@ -53,14 +54,16 @@ class GarplusRunConfig:
     augment_negative_edges: bool = True
     negative_edge_limit: int = 2000
     balance_edge_labels: bool = True
-    mode: str = "decision-tree"
+    mode: str = "fp-growth"
     y_key: str = "e0.interaction_label"
+    target_y_keys: Optional[List[str]] = None
+    include_ml_predicate_targets: bool = True
     max_rows: int = 50
     undirected: bool = True
     undirected_pattern: bool = True
     full_solution: bool = False
     pattern_support: int = 5
-    min_support: int = 100
+    min_support: int = 50
     min_confidence: float = 0.6
     min_value_support_count: int = 20
     max_radius: int = 4
@@ -69,7 +72,9 @@ class GarplusRunConfig:
     max_multi_support: int = 10000
     print_rule_limit: int = 10
     print_deduped_rule_limit: int = 50
+    deduped_rules_output_path: Optional[str] = None
     print_full_payload: bool = False
+    print_payload_snapshot: bool = False
     print_instances: bool = False
     print_instance_limit: int = 5
     print_bn_stats: bool = True
@@ -78,8 +83,13 @@ class GarplusRunConfig:
     sampled_frequent_print_limit: int = 20
     inject_sampled_frequent_patterns: bool = True
     sampled_frequent_pattern_limit: int = 8
+    include_sampled_frequent_edge_pattern: bool = True
     materialize_sampled_frequent_patterns: bool = True
     drop_unknown_target_rows: bool = True
+    ignored_target_values: tuple[str, ...] = ("unknown",)
+    drop_ignored_target_edges: bool = False
+    filter_degree_predicates: bool = False
+    ignored_predicate_key_tokens: tuple[str, ...] = ("degree", "high_degree")
     enable_pattern_bn: bool = True
     tau_p: float = 0.5
     pattern_bn_top_k_per_spawn_node: Optional[int] = None
@@ -94,11 +104,13 @@ class GarplusRunConfig:
     predicate_bn_max_parent_features: int = 12
     predicate_bn_max_feature_cardinality: int = 50
     predicate_bn_focus_target: str = "e0.interaction_label=negative"
+    predicate_bn_focus_targets: Optional[tuple[str, ...]] = None
     predicate_bn_feature_score: str = "bic"
     predicate_bn_estimator: str = "maximum_likelihood"
     predicate_bn_cache_path: Optional[str] = None
     retrain_predicate_bn: bool = True
     ml_predicates: MLPredicateConfig = MLPredicateConfig()
+    predicate_enrichment: PredicateEnrichmentConfig = PredicateEnrichmentConfig()
 
 
 def resolve_path(raw_path: Optional[str], fallback_name: str, auto_discover: bool) -> str:
@@ -142,17 +154,53 @@ def dedupe_rules_semantically(pattern_rules):
     return rows
 
 
-def print_deduped_rules(pattern_rules, limit: int):
+def format_deduped_rule_row(pattern_id, rule, key) -> str:
+    antecedent_key, consequent_key = key
+    return (
+        "  deduped_rule "
+        f"pattern_id={pattern_id} antecedent={antecedent_key} consequent={consequent_key} "
+        f"raw_antecedent={rule.antecedent} raw_consequent={rule.consequent} "
+        f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
+    )
+
+
+def _print_deduped_rule_row(pattern_id, rule, key) -> None:
+    print(format_deduped_rule_row(pattern_id, rule, key))
+
+
+def write_deduped_rules(path: str, deduped_rows) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for pattern_id, rule, key in deduped_rows:
+            handle.write(format_deduped_rule_row(pattern_id, rule, key).strip() + "\n")
+
+
+def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = None):
     deduped = dedupe_rules_semantically(pattern_rules)
-    print(f"[DedupedRules] raw={len(pattern_rules)} unique={len(deduped)} limit={limit}")
-    for pattern_id, rule, key in deduped[:limit]:
-        antecedent_key, consequent_key = key
-        print(
-            "  deduped_rule "
-            f"pattern_id={pattern_id} antecedent={antecedent_key} consequent={consequent_key} "
-            f"raw_antecedent={rule.antecedent} raw_consequent={rule.consequent} "
-            f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
-        )
+    grouped = {"positive": [], "negative": [], "other": []}
+    for row in deduped:
+        _pattern_id, rule, _key = row
+        value = _rule_consequent_value(rule)
+        if value == "positive":
+            grouped["positive"].append(row)
+        elif value == "negative":
+            grouped["negative"].append(row)
+        else:
+            grouped["other"].append(row)
+
+    print(
+        f"[DedupedRules] raw={len(pattern_rules)} unique={len(deduped)} limit_per_group={limit} "
+        f"positive={len(grouped['positive'])} negative={len(grouped['negative'])} other={len(grouped['other'])}"
+    )
+    for group_name in ("positive", "negative", "other"):
+        rows = grouped[group_name]
+        print(f"[DedupedRules/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
+        for pattern_id, rule, key in rows[:limit]:
+            _print_deduped_rule_row(pattern_id, rule, key)
+    if output_path:
+        write_deduped_rules(output_path, deduped)
+        print(f"[DedupedRules] wrote={len(deduped)} path={output_path}")
     return deduped
 
 
@@ -280,23 +328,130 @@ def print_interaction_label_distribution(graph) -> None:
         print(f"[Graph] interaction_label_distribution={counts}")
 
 
+
+def build_target_y_list(graph, cfg: GarplusRunConfig) -> List[str]:
+    """Build Go-style yList: each item is mined as one independent RHS."""
+
+    candidates = list(cfg.target_y_keys) if cfg.target_y_keys else [cfg.y_key]
+    if cfg.include_ml_predicate_targets:
+        edge_keys = {key for edge in graph.all_edges() for key in edge.attrs.keys()}
+        for key in ("ml_equivalence_pred", "ml_similarity_pred", "ml_pred_ppi", "ml_pred_not_ppi", "ml_offline_predicate_name"):
+            if key in edge_keys:
+                candidates.append(f"e0.{key}")
+    seen = set()
+    y_list: List[str] = []
+    for key in candidates:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        y_list.append(key)
+    return y_list
+
+
+def predicate_focus_for_y_key(cfg: GarplusRunConfig, y_key: str) -> Optional[str]:
+    if y_key == cfg.y_key:
+        return cfg.predicate_bn_focus_target
+    if (
+        y_key.endswith("ml_equivalence_pred")
+        or y_key.endswith("ml_similarity_pred")
+        or y_key.endswith("ml_pred_ppi")
+        or y_key.endswith("ml_pred_not_ppi")
+    ):
+        return f"{y_key}=yes"
+    if y_key.endswith("ml_offline_predicate_name"):
+        return f"{y_key}=ml_pred_ppi"
+    return None
+
+def predicate_focus_items_for_y_key(cfg: GarplusRunConfig, y_key: str) -> List[Optional[str]]:
+    if y_key == cfg.y_key and cfg.predicate_bn_focus_targets:
+        items: List[Optional[str]] = []
+        for value in cfg.predicate_bn_focus_targets:
+            text = str(value).strip()
+            if not text:
+                continue
+            items.append(text if "=" in text else f"{y_key}={text}")
+        return items or [predicate_focus_for_y_key(cfg, y_key)]
+    return [predicate_focus_for_y_key(cfg, y_key)]
+
+
+def focus_cache_suffix(focus_item: Optional[str]) -> str:
+    if not focus_item:
+        return "none"
+    return "".join(ch if ch.isalnum() else "_" for ch in focus_item).strip("_") or "none"
+
+
+def predicate_bn_cache_for_y_key(cfg: GarplusRunConfig, y_key: str, focus_item: Optional[str] = None) -> Optional[str]:
+    if not cfg.predicate_bn_cache_path:
+        return None
+    path = Path(cfg.predicate_bn_cache_path)
+    safe_key = "".join(ch if ch.isalnum() else "_" for ch in y_key).strip("_")
+    if focus_item is not None:
+        safe_key = f"{safe_key}_{focus_cache_suffix(focus_item)}"
+    return str(path.with_name(f"{path.stem}_{safe_key}{path.suffix}"))
+
+
+def drop_edges_by_target_values(
+    graph: DataGraph,
+    ignored_values: tuple[str, ...],
+    label_column: str = "interaction_label",
+) -> dict[str, object]:
+    ignored = {str(value).strip().lower() for value in ignored_values if str(value).strip()}
+    if not ignored:
+        return {"enabled": False, "removed": 0, "values": []}
+    kept_edges = []
+    removed_counts = {}
+    for edge in graph.all_edges():
+        value = str(edge.attrs.get(label_column, "")).strip().lower()
+        if value in ignored:
+            removed_counts[value] = removed_counts.get(value, 0) + 1
+        else:
+            kept_edges.append(edge)
+    if not removed_counts:
+        return {"enabled": True, "removed": 0, "values": sorted(ignored), "removed_counts": {}}
+
+    graph.out_edges = {}
+    graph.in_edges = {}
+    graph.edges_by_id = {}
+    for edge in kept_edges:
+        graph.out_edges.setdefault(edge.src, []).append(edge)
+        graph.in_edges.setdefault(edge.dst, []).append(edge)
+        graph.edges_by_id[edge.edge_id] = edge
+    return {
+        "enabled": True,
+        "removed": sum(removed_counts.values()),
+        "values": sorted(ignored),
+        "removed_counts": dict(sorted(removed_counts.items())),
+        "remaining_edges": len(graph.edges_by_id),
+    }
+
+
 def print_rule_consequent_distribution(rules: List[Rule]) -> None:
     print(f"[PredicateSelection] consequent_distribution={rule_consequent_distribution(rules)}")
 
 
-def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
-    diagnostics = selector.negative_diagnostics(limit=limit) if hasattr(selector, "negative_diagnostics") else []
+def print_target_rule_diagnostics(selector, target_value: str, limit: int = 20) -> None:
+    method_name = f"{target_value}_diagnostics"
+    diagnostics = getattr(selector, method_name)(limit=limit) if hasattr(selector, method_name) else []
     if not diagnostics:
-        print("[PredicateSelection] negative_candidate_diagnostics=[]")
+        print(f"[PredicateSelection] {target_value}_candidate_diagnostics=[]")
         return
-    print(f"[PredicateSelection] negative_candidate_diagnostics top={len(diagnostics)}")
+    print(f"[PredicateSelection] {target_value}_candidate_diagnostics top={len(diagnostics)}")
     for item in diagnostics:
         print(
-            "  negative_candidate "
+            f"  {target_value}_candidate "
             f"antecedent={item['antecedent']} consequent={item['consequent']} "
             f"support={item['support']} confidence={item['confidence']:.4f} "
             f"lift={item['lift']:.4f} reason={item['reason']}"
         )
+
+
+def print_rule_candidate_diagnostics(selector, limit: int = 20) -> None:
+    print_target_rule_diagnostics(selector, "negative", limit=limit)
+    print_target_rule_diagnostics(selector, "positive", limit=limit)
+
+
+def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
+    print_target_rule_diagnostics(selector, "negative", limit=limit)
 
 
 def _rule_matches_row(rule: Rule, row: dict) -> bool:
@@ -425,6 +580,7 @@ def load_graph(cfg: GarplusRunConfig, interaction_csv_path: str, node_csv_path: 
 
 def run_demo(cfg: GarplusRunConfig) -> None:
     print(f"=== GAR {cfg.dataset_name} Demo ===")
+    print(f"[RunStart] dataset={cfg.dataset_name}")
     interaction_csv_path = resolve_path(cfg.interaction_csv_path, cfg.fallback_interaction_name, cfg.auto_discover_if_missing)
     node_csv_path = (
         resolve_path(cfg.node_csv_path, cfg.fallback_node_name, cfg.auto_discover_if_missing)
@@ -441,12 +597,21 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"pattern_top_k={cfg.pattern_bn_top_k_per_spawn_node} pattern_min_keep={cfg.pattern_bn_min_keep_per_spawn_node}"
     )
     print(f"[BN] pattern_bn={cfg.enable_pattern_bn} predicate_bn={cfg.enable_predicate_bn}")
+    print(f"[Targets] include_ml_predicate_targets={cfg.include_ml_predicate_targets}")
     print(f"[PatternMode] undirected_pattern={cfg.undirected_pattern}")
 
     graph = load_graph(cfg, interaction_csv_path, node_csv_path)
+    if cfg.drop_ignored_target_edges:
+        drop_summary = drop_edges_by_target_values(graph, cfg.ignored_target_values)
+        print(f"[TargetEdgeFilter] {drop_summary}")
     ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
     if ml_summary.get("enabled"):
         print(f"[MLPredicate] {ml_summary}")
+    enrichment_summary = enrich_numeric_bin_predicates(graph, cfg.predicate_enrichment)
+    if enrichment_summary.get("enabled"):
+        print(f"[PredicateEnrichment] {enrichment_summary}")
+    target_y_list = build_target_y_list(graph, cfg)
+    print(f"[YList] targets={target_y_list}")
     isolated_vertices = sum(1 for node_id in graph.vertices if not graph.out_edges.get(node_id) and not graph.in_edges.get(node_id))
     print(
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
@@ -488,24 +653,8 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             ),
         )
 
-    predicate_bn = None
-    if cfg.enable_predicate_bn:
-        predicate_bn = PredicateBayesianNetwork(
-            PredicateBNConfig(
-                enabled=True,
-                target_key=cfg.y_key,
-                top_k_features=cfg.predicate_bn_top_k_features,
-                min_score=cfg.tau_x,
-                focus_target_item=cfg.predicate_bn_focus_target,
-                min_keep_features=cfg.predicate_bn_min_keep_features,
-                feature_score=cfg.predicate_bn_feature_score,
-                estimator=cfg.predicate_bn_estimator,
-                max_parent_features=cfg.predicate_bn_max_parent_features,
-                max_feature_cardinality=cfg.predicate_bn_max_feature_cardinality,
-                cache_path=cfg.predicate_bn_cache_path,
-                retrain=cfg.retrain_predicate_bn,
-            )
-        )
+    predicate_bns = {}
+
 
     seed = cfg.seed_builder(graph)
     spawn = GraphSpawn(
@@ -539,12 +688,13 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             min_support=cfg.pattern_support,
             max_multi_support=cfg.max_multi_support,
             start_pattern_id=100000,
-            include_edge=False,
+            include_edge=cfg.include_sampled_frequent_edge_pattern,
             materialize_instances=cfg.materialize_sampled_frequent_patterns,
         )[: cfg.sampled_frequent_pattern_limit]
         print(
             f"[SampledFSMInject] injected={len(sampled_structural_patterns)} "
-            f"limit={cfg.sampled_frequent_pattern_limit} materialized={cfg.materialize_sampled_frequent_patterns}"
+            f"limit={cfg.sampled_frequent_pattern_limit} include_edge={cfg.include_sampled_frequent_edge_pattern} "
+            f"materialized={cfg.materialize_sampled_frequent_patterns}"
         )
         for item in sampled_structural_patterns:
             edges = [(edge.src, edge.dst, edge.label) for edge in item.pattern.edges]
@@ -579,8 +729,12 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     for pattern_index, target_pattern in enumerate(patterns_to_mine, start=1):
         edges = [(edge.src, edge.dst, edge.label) for edge in target_pattern.pattern.edges]
         print(
-            f"[Pattern {pattern_index}/{len(patterns_to_mine)}] "
-            f"id={target_pattern.pattern.pattern_id} labels={target_pattern.pattern.node_labels} "
+            f"\n=== Pattern {pattern_index}/{len(patterns_to_mine)} "
+            f"dataset={cfg.dataset_name} pattern_id={target_pattern.pattern.pattern_id} ==="
+        )
+        print(
+            f"[PatternStart] dataset={cfg.dataset_name} pattern_index={pattern_index}/{len(patterns_to_mine)} "
+            f"pattern_id={target_pattern.pattern.pattern_id} labels={target_pattern.pattern.node_labels} "
             f"edges={edges} single_support={target_pattern.single_support()} "
             f"multi_support={target_pattern.multi_support()}"
         )
@@ -588,79 +742,171 @@ def run_demo(cfg: GarplusRunConfig) -> None:
 
         if cfg.mode == "pattern-only":
             continue
-        if cfg.mode == "decision-tree":
-            selector = DecisionTreePredicateSelector(
-                min_support=cfg.min_support,
-                min_confidence=cfg.min_confidence,
-                min_value_support_count=cfg.min_value_support_count,
-                predicate_bn=predicate_bn,
-                drop_target_values={"unknown"} if cfg.drop_unknown_target_rows else None,
+
+        for y_key in target_y_list:
+            print(f"\n--- PredicateMining dataset={cfg.dataset_name} pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} ---")
+            print(f"[YTarget] dataset={cfg.dataset_name} pattern_id={target_pattern.pattern.pattern_id} y_key={y_key}")
+            focus_items = predicate_focus_items_for_y_key(cfg, y_key) if cfg.enable_predicate_bn else [None]
+            focus_results = []
+            for focus_item in focus_items:
+                print(
+                    f"[PredicateFocus] dataset={cfg.dataset_name} pattern_id={target_pattern.pattern.pattern_id} "
+                    f"y_key={y_key} focus={focus_item}"
+                )
+                predicate_bn = None
+                if cfg.enable_predicate_bn:
+                    bn_key = (y_key, focus_item or "")
+                    if bn_key not in predicate_bns:
+                        predicate_bns[bn_key] = PredicateBayesianNetwork(
+                            PredicateBNConfig(
+                                enabled=True,
+                                target_key=y_key,
+                                top_k_features=cfg.predicate_bn_top_k_features,
+                                min_score=cfg.tau_x,
+                                focus_target_item=focus_item,
+                                min_keep_features=cfg.predicate_bn_min_keep_features,
+                                feature_score=cfg.predicate_bn_feature_score,
+                                estimator=cfg.predicate_bn_estimator,
+                                max_parent_features=cfg.predicate_bn_max_parent_features,
+                                max_feature_cardinality=cfg.predicate_bn_max_feature_cardinality,
+                                cache_path=predicate_bn_cache_for_y_key(cfg, y_key, focus_item),
+                                retrain=cfg.retrain_predicate_bn,
+                            )
+                        )
+                    predicate_bn = predicate_bns[bn_key]
+
+                if cfg.mode == "decision-tree":
+                    selector = DecisionTreePredicateSelector(
+                        min_support=cfg.min_support,
+                        min_confidence=cfg.min_confidence,
+                        min_value_support_count=cfg.min_value_support_count,
+                        predicate_bn=predicate_bn,
+                        drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                    )
+                    focus_rules = selector.generate_rules(graph, target_pattern, y_key)
+                    print(
+                        f"[PredicateSelection/DecisionTree] pattern_id={target_pattern.pattern.pattern_id} "
+                        f"focus={focus_item} rules={len(focus_rules)} y_key={y_key}"
+                    )
+                elif cfg.mode == "fp-growth":
+                    selector = FPGrowthPredicateSelector(
+                        min_support=cfg.min_support,
+                        min_confidence=cfg.min_confidence,
+                        min_value_support_count=cfg.min_value_support_count,
+                        predicate_bn=predicate_bn,
+                        drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                    )
+                    focus_rules = selector.generate_rules(graph, target_pattern, y_key)
+                    print(
+                        f"[PredicateSelection/FPGrowth] pattern_id={target_pattern.pattern.pattern_id} "
+                        f"focus={focus_item} rules={len(focus_rules)} y_prefix={y_key}"
+                    )
+                else:
+                    raise ValueError(f"Unsupported mode: {cfg.mode}")
+
+                if getattr(selector, "filtered_feature_keys", None):
+                    dropped_keys = sorted(selector.filtered_feature_keys)
+                    print(
+                        f"[PredicateFilter] pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
+                        f"focus={focus_item} tokens={cfg.ignored_predicate_key_tokens} dropped_keys={len(dropped_keys)} "
+                        f"sample={dropped_keys[:20]}"
+                    )
+                print_rule_consequent_distribution(focus_rules)
+                print_rule_candidate_diagnostics(selector)
+                focus_results.append((focus_item, selector, focus_rules))
+
+            rule_by_key = {}
+            for _focus_item, _selector, focus_rules in focus_results:
+                for rule in focus_rules:
+                    key = (tuple(rule.antecedent), rule.consequent)
+                    current = rule_by_key.get(key)
+                    if current is None or (rule.confidence, rule.support, rule.lift) > (current.confidence, current.support, current.lift):
+                        rule_by_key[key] = rule
+            rules = sorted(rule_by_key.values(), key=lambda item: (item.confidence, item.support, item.lift), reverse=True)
+            active_selector = focus_results[-1][1] if focus_results else None
+            print(
+                f"[PredicateFocusMerge] pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
+                f"focus_runs={len(focus_results)} merged_rules={len(rules)} raw_focus_rules={sum(len(item[2]) for item in focus_results)}"
             )
-            rules = selector.generate_rules(graph, target_pattern, cfg.y_key)
-            print(f"[PredicateSelection/DecisionTree] pattern_id={target_pattern.pattern.pattern_id} rules={len(rules)} y_key={cfg.y_key}")
-            active_selector = selector
-        elif cfg.mode == "fp-growth":
-            selector = FPGrowthPredicateSelector(
-                min_support=cfg.min_support,
-                min_confidence=cfg.min_confidence,
-                min_value_support_count=cfg.min_value_support_count,
-                predicate_bn=predicate_bn,
-                drop_target_values={"unknown"} if cfg.drop_unknown_target_rows else None,
-            )
-            rules = selector.generate_rules(graph, target_pattern, cfg.y_key)
-            print(f"[PredicateSelection/FPGrowth] pattern_id={target_pattern.pattern.pattern_id} rules={len(rules)} y_prefix={cfg.y_key}")
-            active_selector = selector
-        else:
-            raise ValueError(f"Unsupported mode: {cfg.mode}")
 
-        all_pattern_rules.extend((target_pattern.pattern.pattern_id, rule) for rule in rules)
-        print_rule_consequent_distribution(rules)
-        print_negative_rule_diagnostics(active_selector)
-        negative_recall = evaluate_negative_rule_recall(active_selector, graph, target_pattern, rules, cfg.y_key)
-        print(
-            "[NegativeRecall] "
-            f"pattern_id={target_pattern.pattern.pattern_id} "
-            f"negative_rules={negative_recall['negative_rules']} "
-            f"covered_edges={negative_recall['covered_negative_edges']}/{negative_recall['total_negative_edges']} "
-            f"edge_recall={negative_recall['edge_recall']:.4f} "
-            f"covered_instances={negative_recall['covered_negative_instances']}/{negative_recall['negative_instances']} "
-            f"instance_recall={negative_recall['instance_recall']:.4f}"
-        )
-        for rule in rules[: cfg.print_rule_limit]:
-            print(f"  antecedent={rule.antecedent} consequent={rule.consequent} support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}")
-
-        if not rules:
-            print(f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} skipped because no predicate rules were generated")
-            continue
-
-        zl_rules = [predicate_rule_to_zl(rule, target_pattern) for rule in rules]
-        filtered = zl_rule_filter(zl_rules, filter_flag=True, min_confidence=cfg.min_confidence)
-        sender = RuleSender()
-        pattern_view = PatternView.from_pattern(target_pattern.pattern)
-        sent = send_zl_rules(pattern_view, filtered, y_literal=rules[0].consequent, sender=sender)
-        total_sent += sent
-        status = RuleGenerationStatus()
-        update_status_after_generate_rules(status, pattern_view.pattern_id, sent, max(0, len(zl_rules) - sent))
-        print(f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} filtered={len(filtered)} sent={sent}")
-        print(
-            f"  status: discovered_rules={status.discovered_rule_num} "
-            f"abandon_rules={status.abandon_rule_num} abandon_patterns={status.abandon_pattern_num}"
-        )
-        if sender.sent_rules:
-            print("[RuleGeneration] first payload snapshot:")
-            snapshot = dict(sender.sent_rules[0])
-            if cfg.print_full_payload:
-                pprint(snapshot)
+            all_pattern_rules.extend((target_pattern.pattern.pattern_id, rule) for rule in rules)
+            print_rule_consequent_distribution(rules)
+            if y_key.endswith("interaction_label"):
+                recall_negative_value = "negative"
+            elif y_key.endswith("ml_offline_predicate_name"):
+                recall_negative_value = "ml_pred_not_ppi"
             else:
-                pprint(trim_instances(snapshot, cfg))
+                recall_negative_value = "no"
+            target_recall = evaluate_negative_rule_recall(
+                active_selector,
+                graph,
+                target_pattern,
+                rules,
+                y_key,
+                negative_value=recall_negative_value,
+            )
+            print(
+                "[TargetRecall] "
+                f"pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} "
+                f"target_value={recall_negative_value} "
+                f"target_rules={target_recall['negative_rules']} "
+                f"covered_edges={target_recall['covered_negative_edges']}/{target_recall['total_negative_edges']} "
+                f"edge_recall={target_recall['edge_recall']:.4f} "
+                f"covered_instances={target_recall['covered_negative_instances']}/{target_recall['negative_instances']} "
+                f"instance_recall={target_recall['instance_recall']:.4f}"
+            )
+            for rule in rules[: cfg.print_rule_limit]:
+                print(
+                    f"  antecedent={rule.antecedent} consequent={rule.consequent} "
+                    f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
+                )
 
-    deduped_rows = print_deduped_rules(all_pattern_rules, cfg.print_deduped_rule_limit)
+            if not rules:
+                print(
+                    f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} "
+                    f"y_key={y_key} skipped because no predicate rules were generated"
+                )
+                continue
+
+            zl_rules = [predicate_rule_to_zl(rule, target_pattern) for rule in rules]
+            filtered = zl_rule_filter(zl_rules, filter_flag=True, min_confidence=cfg.min_confidence)
+            sender = RuleSender()
+            pattern_view = PatternView.from_pattern(target_pattern.pattern)
+            sent = send_zl_rules(pattern_view, filtered, y_literal=rules[0].consequent, sender=sender)
+            total_sent += sent
+            status = RuleGenerationStatus()
+            update_status_after_generate_rules(status, pattern_view.pattern_id, sent, max(0, len(zl_rules) - sent))
+            print(f"[RuleGeneration] pattern_id={target_pattern.pattern.pattern_id} y_key={y_key} filtered={len(filtered)} sent={sent}")
+            print(
+                f"  status: discovered_rules={status.discovered_rule_num} "
+                f"abandon_rules={status.abandon_rule_num} abandon_patterns={status.abandon_pattern_num}"
+            )
+            if cfg.print_payload_snapshot and sender.sent_rules:
+                print("[RuleGeneration] first payload snapshot:")
+                snapshot = dict(sender.sent_rules[0])
+                if cfg.print_full_payload:
+                    pprint(snapshot)
+                else:
+                    pprint(trim_instances(snapshot, cfg))
+    print(f"\n=== BN Summary dataset={cfg.dataset_name} ===")
+    print_bn_summary(pattern_bn, None, cfg)
+    for bn_key, predicate_bn in predicate_bns.items():
+        if isinstance(bn_key, tuple):
+            y_key, focus_item = bn_key
+        else:
+            y_key, focus_item = bn_key, ""
+        print(f"[PredicateBNTarget] dataset={cfg.dataset_name} y_key={y_key} focus={focus_item or None}")
+        print_bn_summary(None, predicate_bn, cfg)
+
+    print(f"\n=== Final Results dataset={cfg.dataset_name} ===")
+    deduped_rows = print_deduped_rules(all_pattern_rules, cfg.print_deduped_rule_limit, cfg.deduped_rules_output_path)
     raw_rule_distribution = rule_consequent_distribution([rule for _pattern_id, rule in all_pattern_rules])
     deduped_rule_distribution = rule_consequent_distribution([rule for _pattern_id, rule, _key in deduped_rows])
     table_stats = discovered_rule_table_stats(deduped_rows, pattern_size_by_id)
     print(f"[RuleConsequentDistribution] raw={raw_rule_distribution} deduped={deduped_rule_distribution}")
     print_discovered_rule_stats_table(cfg.dataset_name, table_stats)
-    print_bn_summary(pattern_bn, predicate_bn, cfg)
     print(
         f"[Summary] dataset={cfg.dataset_name} patterns_mined={len(patterns_to_mine)} "
         f"raw_rules={len(all_pattern_rules)} deduped_rules={len(deduped_rows)} "
@@ -671,3 +917,12 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"raw_consequents={raw_rule_distribution} deduped_consequents={deduped_rule_distribution} "
         f"total_sent={total_sent}"
     )
+
+
+
+
+
+
+
+
+

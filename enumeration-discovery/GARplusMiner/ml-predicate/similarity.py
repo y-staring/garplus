@@ -14,7 +14,6 @@ from util import dda, ppi, ti
 from util.utils import (
     ObjectPair,
     embedding_scores,
-    lexical_scores,
     labels_from_scores,
     object_text,
     validate_pairs,
@@ -22,34 +21,6 @@ from util.utils import (
 
 
 DEFAULT_EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
-_EMBEDDING_UNAVAILABLE_REASON: str | None = None
-
-
-def score_text_pairs(
-    text_pairs: Sequence[tuple[str, str]],
-    *,
-    backend: str,
-    model_name: str,
-    batch_size: int,
-) -> list[float]:
-    """Score text pairs with embedding, lexical, or auto fallback backend."""
-
-    global _EMBEDDING_UNAVAILABLE_REASON
-    backend = backend.lower()
-    if backend not in {"auto", "embedding", "lexical"}:
-        raise ValueError(f"Unsupported similarity backend: {backend}")
-    if backend == "lexical":
-        return lexical_scores(text_pairs)
-    if backend == "auto" and _EMBEDDING_UNAVAILABLE_REASON is not None:
-        return lexical_scores(text_pairs)
-    try:
-        return embedding_scores(text_pairs, model_name=model_name, batch_size=batch_size)
-    except Exception as exc:
-        if backend == "embedding":
-            raise
-        _EMBEDDING_UNAVAILABLE_REASON = str(exc)
-        print(f"[Similarity] embedding backend unavailable, fallback to lexical: {_EMBEDDING_UNAVAILABLE_REASON}")
-        return lexical_scores(text_pairs)
 
 
 def _model_labels(
@@ -61,25 +32,23 @@ def _model_labels(
     model_name: str,
     batch_size: int,
     max_chars: int,
-    backend: str = "auto",
 ) -> list[int]:
     validate_pairs(pairs)
     text_pairs = [
         (object_text(left, left_fields, max_chars=max_chars), object_text(right, right_fields, max_chars=max_chars))
         for left, right in pairs
     ]
-    scores = score_text_pairs(text_pairs, backend=backend, model_name=model_name, batch_size=batch_size)
+    scores = embedding_scores(text_pairs, model_name=model_name, batch_size=batch_size)
     return labels_from_scores(scores, threshold)
 
 
 def ppi_similarity_labels(
     pairs: Sequence[ObjectPair],
     *,
-    threshold: float = 0.85,
+    threshold: float = 0.94,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     batch_size: int = 64,
     max_chars: int = 900,
-    backend: str = "auto",
 ) -> list[int]:
     return _model_labels(
         pairs,
@@ -89,18 +58,16 @@ def ppi_similarity_labels(
         model_name=model_name,
         batch_size=batch_size,
         max_chars=max_chars,
-        backend=backend,
     )
 
 
 def dda_relatedness_labels(
     pairs: Sequence[ObjectPair],
     *,
-    threshold: float = 0.80,
+    threshold: float = 0.90,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     batch_size: int = 64,
     max_chars: int = 900,
-    backend: str = "auto",
 ) -> list[int]:
     return _model_labels(
         pairs,
@@ -110,18 +77,16 @@ def dda_relatedness_labels(
         model_name=model_name,
         batch_size=batch_size,
         max_chars=max_chars,
-        backend=backend,
     )
 
 
 def ti_relatedness_labels(
     pairs: Sequence[ObjectPair],
     *,
-    threshold: float = 0.80,
+    threshold: float = 1.00,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     batch_size: int = 64,
     max_chars: int = 900,
-    backend: str = "auto",
 ) -> list[int]:
     return _model_labels(
         pairs,
@@ -131,7 +96,6 @@ def ti_relatedness_labels(
         model_name=model_name,
         batch_size=batch_size,
         max_chars=max_chars,
-        backend=backend,
     )
 
 
@@ -142,13 +106,12 @@ ti_similarity_labels = ti_relatedness_labels
 def similarity_labels(
     tables: Mapping[str, Sequence[ObjectPair]],
     *,
-    ppi_threshold: float = 0.85,
-    dda_threshold: float = 0.80,
-    ti_threshold: float = 0.80,
+    ppi_threshold: float = 0.94,
+    dda_threshold: float = 0.90,
+    ti_threshold: float = 1.00,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     batch_size: int = 64,
     max_chars: int = 900,
-    backend: str = "auto",
 ) -> dict[str, list[int]]:
     return {
         "ppi": ppi_similarity_labels(
@@ -157,7 +120,6 @@ def similarity_labels(
             model_name=model_name,
             batch_size=batch_size,
             max_chars=max_chars,
-            backend=backend,
         ),
         "dda": dda_relatedness_labels(
             tables.get("dda", []),
@@ -165,7 +127,6 @@ def similarity_labels(
             model_name=model_name,
             batch_size=batch_size,
             max_chars=max_chars,
-            backend=backend,
         ),
         "ti": ti_relatedness_labels(
             tables.get("ti", []),
@@ -173,7 +134,6 @@ def similarity_labels(
             model_name=model_name,
             batch_size=batch_size,
             max_chars=max_chars,
-            backend=backend,
         ),
     }
 
@@ -210,7 +170,6 @@ def _write_csv_labels(
     batch_size: int,
     chunk_size: int,
     max_chars: int,
-    backend: str,
 ) -> dict[str, object]:
     started = time.time()
     rows = 0
@@ -226,7 +185,7 @@ def _write_csv_labels(
         nonlocal total, score_min, score_max
         if not batch_rows:
             return
-        scores = score_text_pairs(batch_pairs, backend=backend, model_name=model_name, batch_size=batch_size)
+        scores = embedding_scores(batch_pairs, model_name=model_name, batch_size=batch_size)
         labels = labels_from_scores(scores, threshold)
         for row, score, label in zip(batch_rows, scores, labels):
             row["similarity_score"] = f"{score:.6f}"
@@ -264,7 +223,6 @@ def _write_csv_labels(
     return {
         "dataset": dataset,
         "model": model_name,
-        "backend": backend,
         "input": str(input_path),
         "output": str(output_path),
         "rows": rows,
@@ -283,14 +241,13 @@ def run_csv(
     input_dir: Path,
     output_dir: Path,
     *,
-    ppi_threshold: float = 0.85,
-    dda_threshold: float = 0.80,
-    ti_threshold: float = 0.80,
+    ppi_threshold: float = 0.94,
+    dda_threshold: float = 0.90,
+    ti_threshold: float = 1.00,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     batch_size: int = 64,
     chunk_size: int = 2048,
     max_chars: int = 900,
-    backend: str = "auto",
 ) -> list[dict[str, object]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     jobs = (
@@ -318,7 +275,6 @@ def run_csv(
             batch_size=batch_size,
             chunk_size=chunk_size,
             max_chars=max_chars,
-            backend=backend,
         )
         for dataset, filename, left_fields, right_fields, threshold, pair_func in jobs
     ]
@@ -331,16 +287,15 @@ def run_csv(
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir", type=Path, default=root / "rudik" / "GAR+数据")
+    parser.add_argument("--input-dir", type=Path, default=root / "rudik" / "GAR+\u6570\u636e")
     parser.add_argument("--output-dir", type=Path, default=root / "rudik" / "GARplus_data_similarity")
-    parser.add_argument("--ppi-threshold", type=float, default=0.85)
-    parser.add_argument("--dda-threshold", type=float, default=0.80)
-    parser.add_argument("--ti-threshold", type=float, default=0.80)
+    parser.add_argument("--ppi-threshold", type=float, default=0.94)
+    parser.add_argument("--dda-threshold", type=float, default=0.90)
+    parser.add_argument("--ti-threshold", type=float, default=1.00)
     parser.add_argument("--model-name", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--max-chars", type=int, default=900)
-    parser.add_argument("--backend", choices=("auto", "embedding", "lexical"), default="lexical")
     args = parser.parse_args()
     summary = run_csv(
         args.input_dir,
@@ -352,7 +307,6 @@ def main() -> None:
         batch_size=args.batch_size,
         chunk_size=args.chunk_size,
         max_chars=args.max_chars,
-        backend=args.backend,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
