@@ -11,7 +11,7 @@ For one fixed frequent pattern we:
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Callable
 
 from graph_types import DataGraph, FrequentPattern, instance_literals
 
@@ -159,14 +159,33 @@ class PredicateTableMixin:
         return pruned_rows
 
 
+TreeCondition = Tuple[str, str, object]
+
+
+@dataclass
+class _DecisionLeaf:
+    conditions: Tuple[TreeCondition, ...]
+    row_indexes: Tuple[int, ...]
+
+
 class DecisionTreePredicateSelector(PredicateTableMixin):
     """A lightweight decision-tree-style selector."""
 
-    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5, min_value_support_count: int = 1, predicate_bn: Optional[Any] = None, drop_target_values: Optional[set] = None, drop_feature_key_tokens: Optional[tuple[str, ...]] = None) -> None:
+    def __init__(
+        self,
+        min_support: float = 0.1,
+        min_confidence: float = 0.5,
+        min_value_support_count: int = 1,
+        predicate_bn: Optional[Any] = None,
+        drop_target_values: Optional[set] = None,
+        drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
+        max_depth: int = 3,
+    ) -> None:
         super().__init__(min_value_support_count=min_value_support_count, drop_target_values=drop_target_values, drop_feature_key_tokens=drop_feature_key_tokens)
         self.min_support = min_support
         self.min_confidence = min_confidence
         self.predicate_bn = predicate_bn
+        self.max_depth = max(1, int(max_depth))
 
     def generate_literal_df(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
         """Build the per-pattern table and keep only rows that still contain the target."""
@@ -176,6 +195,13 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         rows = [row for row in rows if y_key in row]
         rows = self.filter_target_rows(rows, y_key)
         return self.filter_feature_keys(rows, y_key)
+
+    def generate_scoring_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
+        """Build unpruned rows used to recompute support/confidence for mined rules."""
+
+        rows = self.build_instance_rows(graph, frequent_pattern)
+        rows = [row for row in rows if y_key in row]
+        return self.filter_target_rows(rows, y_key)
 
     def corr_analysis(self, rows: List[Dict[str, object]], y_key: str) -> List[str]:
         """A simple feature-screening heuristic based on equality rate to `y_key`."""
@@ -192,12 +218,90 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
                 selected.append(key)
         return selected
 
+    @staticmethod
+    def _condition_to_literal(condition: TreeCondition) -> str:
+        key, op, value = condition
+        return f"{key}{op}{value}"
+
+    @staticmethod
+    def _condition_matches(row: Dict[str, object], condition: TreeCondition) -> bool:
+        key, op, value = condition
+        if op == "=":
+            return str(row.get(key)) == str(value)
+        if op == "!=":
+            return str(row.get(key)) != str(value)
+        return False
+
+    @staticmethod
+    def _gini(rows: List[Dict[str, object]], indexes: List[int], y_key: str) -> float:
+        if not indexes:
+            return 0.0
+        counts = Counter(rows[index].get(y_key) for index in indexes)
+        total = len(indexes)
+        return 1.0 - sum((count / total) ** 2 for count in counts.values())
+
+    def _best_split(
+        self,
+        rows: List[Dict[str, object]],
+        indexes: List[int],
+        candidate_keys: List[str],
+        y_key: str,
+        min_leaf_size: int,
+    ) -> Optional[Tuple[str, object, float, List[int], List[int]]]:
+        parent_impurity = self._gini(rows, indexes, y_key)
+        if parent_impurity <= 0:
+            return None
+        best: Optional[Tuple[str, object, float, List[int], List[int]]] = None
+        best_gain = 0.0
+        total = len(indexes)
+        for key in candidate_keys:
+            value_counts = Counter(rows[index].get(key) for index in indexes if key in rows[index])
+            for value, value_count in value_counts.items():
+                if value_count < min_leaf_size or total - value_count < min_leaf_size:
+                    continue
+                right = [index for index in indexes if str(rows[index].get(key)) == str(value)]
+                left = [index for index in indexes if str(rows[index].get(key)) != str(value)]
+                weighted = (len(left) / total) * self._gini(rows, left, y_key) + (len(right) / total) * self._gini(rows, right, y_key)
+                gain = parent_impurity - weighted
+                if gain > best_gain:
+                    best_gain = gain
+                    best = (key, value, gain, left, right)
+        return best
+
+    def _decision_leaves(
+        self,
+        rows: List[Dict[str, object]],
+        candidate_keys: List[str],
+        y_key: str,
+        support_threshold: int,
+    ) -> List[_DecisionLeaf]:
+        leaves: List[_DecisionLeaf] = []
+        min_leaf_size = max(1, min(support_threshold, len(rows)))
+
+        def walk(indexes: List[int], depth: int, conditions: Tuple[TreeCondition, ...]) -> None:
+            if depth >= self.max_depth or len(indexes) < max(2, min_leaf_size * 2):
+                leaves.append(_DecisionLeaf(conditions=conditions, row_indexes=tuple(indexes)))
+                return
+            split = self._best_split(rows, indexes, candidate_keys, y_key, min_leaf_size)
+            if split is None:
+                leaves.append(_DecisionLeaf(conditions=conditions, row_indexes=tuple(indexes)))
+                return
+            key, value, _gain, left, right = split
+            if left:
+                walk(left, depth + 1, conditions + ((key, "!=", value),))
+            if right:
+                walk(right, depth + 1, conditions + ((key, "=", value),))
+
+        walk(list(range(len(rows))), 0, tuple())
+        return [leaf for leaf in leaves if leaf.conditions]
+
     def generate_rules(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Rule]:
-        """Generate simple `one antecedent -> one target` rules."""
+        """Generate path-based decision-tree rules, aligned with the Go implementation."""
 
         self.reset_diagnostics()
         rows = self.generate_literal_df(graph, frequent_pattern, y_key)
-        if not rows:
+        scoring_rows = self.generate_scoring_rows(graph, frequent_pattern, y_key)
+        if not rows or not scoring_rows:
             return []
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_key)
@@ -212,18 +316,26 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
             candidate_keys = self.corr_analysis(rows, y_key)
         if not candidate_keys:
             return []
+        support_threshold = self.min_support_count(len(scoring_rows))
+        y_count = Counter(row.get(y_key) for row in scoring_rows)
         rules: List[Rule] = []
-        support_threshold = self.min_support_count(len(rows))
-        for key in candidate_keys:
-            grouped: Dict[Tuple[object, object], int] = Counter((row.get(key), row.get(y_key)) for row in rows)
-            x_count = Counter(row.get(key) for row in rows)
-            y_count = Counter(row.get(y_key) for row in rows)
-            for (x_value, y_value), pair_count in grouped.items():
+        for leaf in self._decision_leaves(rows, candidate_keys, y_key, support_threshold):
+            antecedent = tuple(self._condition_to_literal(condition) for condition in leaf.conditions)
+            matched_rows = [
+                row
+                for row in scoring_rows
+                if all(self._condition_matches(row, condition) for condition in leaf.conditions)
+            ]
+            if not matched_rows:
+                continue
+            leaf_y_count = Counter(row.get(y_key) for row in matched_rows)
+            antecedent_count = len(matched_rows)
+            for y_value, pair_count in leaf_y_count.items():
                 support = pair_count
-                confidence = pair_count / x_count[x_value]
-                lift = confidence / (y_count[y_value] / len(rows))
+                confidence = pair_count / antecedent_count if antecedent_count else 0.0
+                base_rate = y_count[y_value] / len(scoring_rows)
+                lift = confidence / base_rate if base_rate else 0.0
                 consequent = f"{y_key}={y_value}"
-                antecedent = (f"{key}={x_value}",)
                 failed_reasons = []
                 if support < support_threshold:
                     failed_reasons.append(f"support<{support_threshold}")
@@ -233,6 +345,13 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
                     self.record_diagnostic(antecedent, consequent, support, confidence, lift, ";".join(failed_reasons))
                 else:
                     rules.append(Rule(antecedent=antecedent, consequent=consequent, support=support, confidence=confidence, lift=lift))
+        unique: Dict[Tuple[Tuple[str, ...], str], Rule] = {}
+        for rule in rules:
+            key = (rule.antecedent, rule.consequent)
+            current = unique.get(key)
+            if current is None or (rule.confidence, rule.support, rule.lift) > (current.confidence, current.support, current.lift):
+                unique[key] = rule
+        rules = list(unique.values())
         if self.predicate_bn is not None:
             rules = self.predicate_bn.rank_rules(rules)
         return rules

@@ -54,10 +54,11 @@ class GarplusRunConfig:
     augment_negative_edges: bool = True
     negative_edge_limit: int = 2000
     balance_edge_labels: bool = True
-    mode: str = "fp-growth"
+    mode: str = "decision-tree"  # fp-growth
     y_key: str = "e0.interaction_label"
     target_y_keys: Optional[List[str]] = None
     include_ml_predicate_targets: bool = True
+    decision_tree_max_depth: int = 3
     max_rows: int = 50
     undirected: bool = True
     undirected_pattern: bool = True
@@ -134,6 +135,14 @@ def normalize_rule_literal_for_dedupe(item: str) -> str:
             key = f"v*.{attr}"
     return f"{key}={value}" if value else key
 
+def parse_rule_literal(item: str) -> tuple[str, str, str]:
+    if "!=" in item:
+        key, value = item.split("!=", 1)
+        return key, "!=", value
+    if "=" in item:
+        key, value = item.split("=", 1)
+        return key, "=", value
+    return item, "", ""
 
 def rule_semantic_key(rule: Rule):
     normalized_antecedent = tuple(sorted(normalize_rule_literal_for_dedupe(item) for item in rule.antecedent))
@@ -154,30 +163,55 @@ def dedupe_rules_semantically(pattern_rules):
     return rows
 
 
-def format_deduped_rule_row(pattern_id, rule, key) -> str:
+def compute_rule_closures(deduped_rows) -> dict:
+    implications = []
+    for _pattern_id, _rule, key in deduped_rows:
+        antecedent_key, consequent_key = key
+        implications.append((set(antecedent_key), consequent_key))
+
+    closures = {}
+    for _pattern_id, _rule, key in deduped_rows:
+        antecedent_key, _consequent_key = key
+        closure = set(antecedent_key)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in implications:
+                if lhs.issubset(closure) and rhs not in closure:
+                    closure.add(rhs)
+                    changed = True
+        closures[key] = tuple(sorted(closure))
+    return closures
+
+
+def format_deduped_rule_row(pattern_id, rule, key, closure=None) -> str:
     antecedent_key, consequent_key = key
+    closure_text = f" closure={closure}" if closure is not None else ""
     return (
         "  deduped_rule "
         f"pattern_id={pattern_id} antecedent={antecedent_key} consequent={consequent_key} "
         f"raw_antecedent={rule.antecedent} raw_consequent={rule.consequent} "
         f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
+        f"{closure_text}"
     )
 
 
-def _print_deduped_rule_row(pattern_id, rule, key) -> None:
-    print(format_deduped_rule_row(pattern_id, rule, key))
+def _print_deduped_rule_row(pattern_id, rule, key, closure=None) -> None:
+    print(format_deduped_rule_row(pattern_id, rule, key, closure=closure))
 
 
-def write_deduped_rules(path: str, deduped_rows) -> None:
+def write_deduped_rules(path: str, deduped_rows, closures=None) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         for pattern_id, rule, key in deduped_rows:
-            handle.write(format_deduped_rule_row(pattern_id, rule, key).strip() + "\n")
+            closure = closures.get(key) if closures else None
+            handle.write(format_deduped_rule_row(pattern_id, rule, key, closure=closure).strip() + "\n")
 
 
 def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = None):
     deduped = dedupe_rules_semantically(pattern_rules)
+    closures = compute_rule_closures(deduped)
     grouped = {"positive": [], "negative": [], "other": []}
     for row in deduped:
         _pattern_id, rule, _key = row
@@ -197,9 +231,9 @@ def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = 
         rows = grouped[group_name]
         print(f"[DedupedRules/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
         for pattern_id, rule, key in rows[:limit]:
-            _print_deduped_rule_row(pattern_id, rule, key)
+            _print_deduped_rule_row(pattern_id, rule, key, closure=closures.get(key))
     if output_path:
-        write_deduped_rules(output_path, deduped)
+        write_deduped_rules(output_path, deduped, closures=closures)
         print(f"[DedupedRules] wrote={len(deduped)} path={output_path}")
     return deduped
 
@@ -453,6 +487,15 @@ def print_rule_candidate_diagnostics(selector, limit: int = 20) -> None:
 def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
     print_target_rule_diagnostics(selector, "negative", limit=limit)
 
+def _rule_matches_row(rule: Rule, row: dict) -> bool:
+    for antecedent in rule.antecedent:
+        key, op, value = parse_rule_literal(antecedent)
+        row_value = str(row.get(key))
+        if op == "=" and row_value != value:
+            return False
+        if op == "!=" and row_value == value:
+            return False
+    return True
 
 def _rule_matches_row(rule: Rule, row: dict) -> bool:
     for antecedent in rule.antecedent:
@@ -505,15 +548,16 @@ def evaluate_negative_rule_recall(selector, graph, frequent_pattern: FrequentPat
     }
 
 
+
 def predicate_rule_to_zl(rule: Rule, frequent_pattern: FrequentPattern) -> ZLRule:
     general_keys = []
     values = []
     semantics = []
     for antecedent in rule.antecedent:
-        key, value = antecedent.split("=", 1)
+        key, op, value = parse_rule_literal(antecedent)
         general_keys.append(key)
         values.append([value])
-        semantics.append("or")
+        semantics.append("not" if op == "!=" else "or")
     y_key, _ = rule.consequent.split("=", 1)
     xy_support = max(0, int(rule.support))
     xy_support_single = min(frequent_pattern.single_support(), xy_support)
@@ -783,6 +827,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         predicate_bn=predicate_bn,
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
+                        max_depth=cfg.decision_tree_max_depth,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(
@@ -917,12 +962,3 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"raw_consequents={raw_rule_distribution} deduped_consequents={deduped_rule_distribution} "
         f"total_sent={total_sent}"
     )
-
-
-
-
-
-
-
-
-
