@@ -17,6 +17,7 @@ Overall GAR flow in this Python version:
 """
 
 from dataclasses import dataclass, field
+from itertools import permutations, product
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 
@@ -145,6 +146,38 @@ class GraphPattern:
                 left, right = right, left
             edges.append((left, right, edge.label))
         return tuple(self.node_labels), tuple(sorted(edges, key=str))
+
+    def topology_canonical_code(self, max_exact_nodes: int = 8) -> Tuple[object, ...]:
+        """Canonical unlabeled undirected code used for topology-only dedupe."""
+
+        node_count = self.node_count()
+        undirected_edges = {
+            (min(edge.src, edge.dst), max(edge.src, edge.dst))
+            for edge in self.edges
+            if edge.src != edge.dst
+        }
+        if node_count > max_exact_nodes:
+            return ("topology-fallback", node_count, tuple(sorted(undirected_edges)))
+
+        adjacency = [set() for _ in range(node_count)]
+        for left, right in undirected_edges:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+        degree_groups: Dict[int, List[int]] = {}
+        for node_id, neighbors in enumerate(adjacency):
+            degree_groups.setdefault(len(neighbors), []).append(node_id)
+        group_orders = [list(permutations(nodes)) for _degree, nodes in sorted(degree_groups.items())]
+        best = None
+        for ordered_groups in product(*group_orders):
+            ordered_nodes = tuple(node for group in ordered_groups for node in group)
+            bit_code = tuple(
+                1 if ordered_nodes[right] in adjacency[ordered_nodes[left]] else 0
+                for left in range(node_count)
+                for right in range(left + 1, node_count)
+            )
+            if best is None or bit_code < best:
+                best = bit_code
+        return ("topology", node_count, len(undirected_edges), best or tuple())
     def has_edge(self, src: int, dst: int, label: Label) -> bool:
         return any(edge.src == src and edge.dst == dst and edge.label == label for edge in self.edges)
 
@@ -247,7 +280,12 @@ class PatternOptions:
     timeout_seconds: int = 1
     timeout_vf3_seconds: int = 15
     parallel_edge: bool = True
-    undirected_pattern: bool = False
+    undirected_pattern: bool = True
+    topology_only_dedup: bool = False
+    topology_dedupe_respect_direction: bool = False
+    global_vspawn_instances: bool = False
+    extension_debug: bool = False
+    extension_debug_limit: int = 500
 
 
 @dataclass

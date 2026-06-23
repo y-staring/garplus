@@ -47,6 +47,10 @@ CONFIG = GarplusRunConfig(
     predicate_bn_cache_path=str(PROCESSED_DIR / "ti" / "predicate_bn_negative.pkl"),
     deduped_rules_output_path=str(PROCESSED_DIR / "ti" / "deduped_rules.txt"),
     include_ml_predicate_targets=False,
+    undirected=False,
+    undirected_pattern=False,
+    topology_only_pattern_dedup=True,
+    topology_dedupe_respect_direction=True,
     filter_degree_predicates=True,
     ignored_predicate_key_tokens=("degree", "high_degree", "sampled_", "augmented_negative", "direction_role", "edgelabel", "ml_equivalence"),
     ignored_target_values=("unknown", "neutral"),
@@ -69,5 +73,4 @@ if __name__ == "__main__":
     start_time = time.time()
     main()
     print("running cost:", time.time() - start_time)
-
 

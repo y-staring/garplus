@@ -270,7 +270,9 @@ def _call_networkx_matcher(pattern_graph: nx.DiGraph, data_graph: nx.DiGraph, at
         node_match=lambda data_attrs, pattern_attrs: _node_compatible(pattern_attrs, data_attrs),
         edge_match=lambda data_attrs, pattern_attrs: _edge_compatible(pattern_attrs, data_attrs),
     )
-    for data_to_pattern in matcher.subgraph_isomorphisms_iter():
+    # GAR needs a non-induced subgraph match: extra edges among already mapped
+    # data vertices must not invalidate a valid pattern embedding.
+    for data_to_pattern in matcher.subgraph_monomorphisms_iter():
         pattern_to_data = {pattern_node: data_node for data_node, pattern_node in data_to_pattern.items()}
         if len(pattern_to_data) == pattern_graph.number_of_nodes():
             yield pattern_to_data

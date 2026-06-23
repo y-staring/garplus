@@ -65,6 +65,14 @@ TARGET_NUM = 2000
 #   refinement / negative-rule mining.
 SAMPLING_MODE = "signed_negative_aware"
 NEGATIVE_CENTER_RATIO = 0.5
+# The raw-pool ratio alone is not enough: the embedding selector is label-blind
+# and can discard most negative-centred graphs.  Reserve this share *after*
+# selection as well, so ppi_selected.pt / dda_selected.pt / ti_selected.pt
+# contain negative edges without the later isolated-edge augmentation.
+SELECTED_NEGATIVE_CENTER_RATIO = 0.5
+# PyG reuses the existing *_raw.pt by default.  Set this to True only when you
+# want the script to delete that cache and regenerate the raw pool.
+FORCE_RESAMPLE_RAW_POOL = False
 INCLUDE_POSITIVE_EDGE_CENTERS = True
 INTERACTION_LABEL_COL = "interaction_label"
 NEGATIVE_LABEL = "negative"
@@ -76,6 +84,7 @@ DEFAULT_RELATION = os.environ.get("GARPLUS_SAMPLING_RELATION", "ppi").strip().lo
 RELATION_CONFIGS = {
     "ppi": {
         "name": "PPI",
+        "directed": False,
         "edge_csv": os.path.join(SIGNED_DATA_DIR, "protein_protein_signed.csv"),
         "node_csv": os.path.join(SIGNED_DATA_DIR, "protein.csv"),
         "node_csvs": [
@@ -91,6 +100,7 @@ RELATION_CONFIGS = {
     },
     "dda": {
         "name": "DDA",
+        "directed": True,
         "edge_csv": os.path.join(SIGNED_DATA_DIR, "drug_disease_signed.csv"),
         "node_csv": None,
         "node_csvs": [
@@ -106,6 +116,7 @@ RELATION_CONFIGS = {
     },
     "ti": {
         "name": "TI",
+        "directed": True,
         "edge_csv": os.path.join(SIGNED_DATA_DIR, "gene_disease_signed.csv"),
         "node_csv": None,
         "node_csvs": [
@@ -131,7 +142,7 @@ PROCESSED_DIR = RELATION_CONFIGS[DEFAULT_RELATION]["processed_dir"]
 ENCODER_FILENAME = f"{DEFAULT_RELATION}_order_encoder.pt"
 EMB_FILENAME = f"{DEFAULT_RELATION}_train_embeddings.pt"
 RAW_FILENAME = f"{DEFAULT_RELATION}_raw.pt"
-SELECTED_FILENAME = f"{DEFAULT_RELATION}_selected.pt"
+SELECTED_FILENAME = f"{DEFAULT_RELATION}_selected_negative_centered.pt"
 
 
 class PickPatternPPIDataset(InMemoryDataset):
@@ -241,7 +252,7 @@ def build_signed_graph(edge_csv: str, node_csv: str = None, relation_config=None
         rel_series = df_edges[rel_col].astype(str).str.strip().str.lower()
         df_edges = df_edges[rel_series.isin(["protein_protein", "protein-protein"])].copy()
 
-    graph = nx.Graph()
+    graph = nx.DiGraph() if relation_config.get("directed", False) else nx.Graph()
     valid_nodes = None
     node_sources = []
     if node_csv:
@@ -315,7 +326,13 @@ def build_signed_graph(edge_csv: str, node_csv: str = None, relation_config=None
     )
     return graph
 
-def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None) -> Data:
+def graph_to_pyg(
+    subgraph: nx.Graph,
+    center_node: int = None,
+    center_nodes=None,
+    sampling_center_label: str = "unknown",
+    directed: bool = False,
+) -> Data:
     node_list = list(subgraph.nodes())
     node_to_idx = {node_id: idx for idx, node_id in enumerate(node_list)}
     if center_nodes is None:
@@ -345,8 +362,9 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None)
         label = str(attrs.get("interaction_label", "unknown")).strip().lower()
         directed_edges.append((node_to_idx[src], node_to_idx[dst]))
         edge_labels.append(label)
-        directed_edges.append((node_to_idx[dst], node_to_idx[src]))
-        edge_labels.append(label)
+        if not directed:
+            directed_edges.append((node_to_idx[dst], node_to_idx[src]))
+            edge_labels.append(label)
 
     edge_index = torch.tensor(directed_edges, dtype=torch.long).t().contiguous()
     num_nodes = len(node_list)
@@ -366,6 +384,12 @@ def graph_to_pyg(subgraph: nx.Graph, center_node: int = None, center_nodes=None)
     data.center_orig_id = torch.tensor(center_nodes[:2] if center_nodes else [node_list[0]], dtype=torch.long)
     label_to_id = {NEGATIVE_LABEL: 1, POSITIVE_LABEL: 2, "neutral": 3, "unknown": 0}
     data.edge_label = torch.tensor([label_to_id.get(label, 0) for label in edge_labels], dtype=torch.long)
+    # Persist the label of the edge used to construct this subgraph.  This is
+    # deliberately separate from edge_label: it survives batching and lets the
+    # final diversity selector enforce a class quota.
+    data.sampling_center_label = torch.tensor(
+        [label_to_id.get(sampling_center_label, 0)], dtype=torch.long
+    )
     return data
 
 
@@ -407,7 +431,8 @@ def sample_k_hop_subgraphs(
 
         if ego.number_of_nodes() > max_nodes:
             bfs_nodes = []
-            for node in nx.bfs_tree(ego, source=center).nodes():
+            traversal_graph = ego.to_undirected() if ego.is_directed() else ego
+            for node in nx.bfs_tree(traversal_graph, source=center).nodes():
                 bfs_nodes.append(node)
                 if len(bfs_nodes) >= max_nodes:
                     break
@@ -420,7 +445,7 @@ def sample_k_hop_subgraphs(
         if signature in seen_signatures:
             continue
         seen_signatures.add(signature)
-        subgraphs.append(graph_to_pyg(ego, center_node=center))
+        subgraphs.append(graph_to_pyg(ego, center_node=center, directed=graph.is_directed()))
         pbar.update(1)
 
     pbar.close()
@@ -437,8 +462,9 @@ def _limited_edge_centered_subgraph(graph: nx.Graph, src: int, dst: int, k_hop: 
     dst_ego = nx.ego_graph(graph, dst, radius=k_hop, undirected=True)
     node_candidates = []
     seen = set()
+    traversal_graph = graph.to_undirected() if graph.is_directed() else graph
     for root in (src, dst):
-        for node_id in nx.bfs_tree(graph, source=root).nodes():
+        for node_id in nx.bfs_tree(traversal_graph, source=root).nodes():
             if node_id in src_ego or node_id in dst_ego:
                 if node_id not in seen:
                     node_candidates.append(node_id)
@@ -509,7 +535,14 @@ def sample_signed_k_hop_subgraphs(
         if signature in seen_signatures:
             continue
         seen_signatures.add(signature)
-        subgraphs.append(graph_to_pyg(subgraph, center_nodes=[src, dst]))
+        subgraphs.append(
+            graph_to_pyg(
+                subgraph,
+                center_nodes=[src, dst],
+                sampling_center_label=NEGATIVE_LABEL,
+                directed=graph.is_directed(),
+            )
+        )
 
     attempts = 0
     max_attempts = max(num_subgraphs * 20, 1000)
@@ -525,7 +558,8 @@ def sample_signed_k_hop_subgraphs(
             ego = nx.ego_graph(graph, center, radius=k_hop, undirected=True)
             if ego.number_of_nodes() > max_nodes:
                 bfs_nodes = []
-                for node in nx.bfs_tree(ego, source=center).nodes():
+                traversal_graph = ego.to_undirected() if ego.is_directed() else ego
+                for node in nx.bfs_tree(traversal_graph, source=center).nodes():
                     bfs_nodes.append(node)
                     if len(bfs_nodes) >= max_nodes:
                         break
@@ -537,7 +571,15 @@ def sample_signed_k_hop_subgraphs(
         if signature in seen_signatures:
             continue
         seen_signatures.add(signature)
-        subgraphs.append(graph_to_pyg(ego, center_nodes=center_nodes))
+        center_label = POSITIVE_LABEL if len(center_nodes) == 2 else "unknown"
+        subgraphs.append(
+            graph_to_pyg(
+                ego,
+                center_nodes=center_nodes,
+                sampling_center_label=center_label,
+                directed=graph.is_directed(),
+            )
+        )
         pbar.update(1)
     pbar.close()
     print(f"[SampleSigned] Collected {len(subgraphs)} signed-aware subgraphs")
@@ -546,6 +588,68 @@ def sample_signed_k_hop_subgraphs(
 
 def load_data_list_from_inmemory(dataset):
     return [dataset.get(i) for i in range(len(dataset))]
+
+
+def _center_label_id(graph: Data) -> int:
+    """Read a persisted centre-edge label; old raw caches default to unknown."""
+
+    value = getattr(graph, "sampling_center_label", None)
+    if value is None:
+        return 0
+    return int(value.reshape(-1)[0].item())
+
+
+def select_graphs_with_negative_quota(
+    embs: np.ndarray,
+    graph_list: List[Data],
+    target_num: int,
+    negative_ratio: float,
+) -> List[int]:
+    """Run the diversity selector within label strata, then merge its results.
+
+    A negative-centred graph is a graph whose construction edge was labelled
+    negative.  Selecting it does not trim its context, therefore both endpoints
+    retain their real k-hop neighbours instead of becoming degree-1 nodes.
+    """
+
+    target_num = min(target_num, len(graph_list))
+    if target_num <= 0:
+        return []
+
+    negative_idx = [i for i, graph in enumerate(graph_list) if _center_label_id(graph) == 1]
+    other_idx = [i for i, graph in enumerate(graph_list) if _center_label_id(graph) != 1]
+    negative_target = min(len(negative_idx), round(target_num * negative_ratio))
+
+    def select_from(indices: List[int], count: int) -> List[int]:
+        if count <= 0 or not indices:
+            return []
+        count = min(count, len(indices))
+        local_idx = select_graphs(
+            embs=embs[indices],
+            method=SELECTOR,
+            k=count,
+            seed=seed,
+            sigma=PICK_SIGMA,
+            chi=PICK_CHI,
+        )
+        return [indices[int(i)] for i in local_idx]
+
+    selected = select_from(negative_idx, negative_target)
+    selected.extend(select_from(other_idx, target_num - len(selected)))
+
+    # If a stratum is smaller than its quota, use any still-unselected graphs.
+    if len(selected) < target_num:
+        selected_set = set(selected)
+        remainder = [i for i in range(len(graph_list)) if i not in selected_set]
+        selected.extend(select_from(remainder, target_num - len(selected)))
+
+    negative_set = set(negative_idx)
+    print(
+        f"[SelectSigned] raw_negative_centered={len(negative_idx)} "
+        f"target_negative_centered={negative_target} "
+        f"selected_negative_centered={sum(i in negative_set for i in selected)}"
+    )
+    return selected
 
 
 @torch.no_grad()
@@ -629,6 +733,13 @@ def main(argv=None):
     encoder_path = os.path.join(processed_dir, encoder_filename)
     emb_path = os.path.join(processed_dir, emb_filename)
     selected_path = os.path.join(processed_dir, selected_filename)
+    raw_path = os.path.join(processed_dir, raw_filename)
+
+    if not 0.0 <= SELECTED_NEGATIVE_CENTER_RATIO <= 1.0:
+        raise ValueError("SELECTED_NEGATIVE_CENTER_RATIO must be within [0, 1]")
+    if FORCE_RESAMPLE_RAW_POOL and os.path.exists(raw_path):
+        os.remove(raw_path)
+        print(f"[Cache] Removed raw pool so it will be rebuilt: {raw_path}")
 
     raw_dataset = PickPatternPPIDataset(
         root=processed_dir,
@@ -695,13 +806,11 @@ def main(argv=None):
         embs = compute_graph_embeddings(model, data_list)
         embs_np = embs.numpy()
 
-    selected_idx = select_graphs(
+    selected_idx = select_graphs_with_negative_quota(
         embs=embs_np,
-        method=SELECTOR,
-        k=args.target_num,
-        seed=seed,
-        sigma=PICK_SIGMA,
-        chi=PICK_CHI,
+        graph_list=data_list,
+        target_num=args.target_num,
+        negative_ratio=SELECTED_NEGATIVE_CENTER_RATIO,
     )
 
     if len(selected_idx) == 0:
@@ -726,6 +835,7 @@ def main(argv=None):
             "k_hop": K_HOP,
             "sampling_mode": SAMPLING_MODE,
             "negative_center_ratio": NEGATIVE_CENTER_RATIO,
+            "selected_negative_center_ratio": SELECTED_NEGATIVE_CENTER_RATIO,
         },
         emb_path,
     )

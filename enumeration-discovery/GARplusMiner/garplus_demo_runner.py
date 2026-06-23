@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from pprint import pprint
 from typing import Callable, List, Optional
 
-from graph_types import DataGraph, FrequentPattern, PatternOptions
+from graph_types import DataGraph, FrequentPattern, GraphInstance, PatternOptions
 from garplus_ml_predicates import MLPredicateConfig, inject_ml_predicates
 from predicate_enrichment import PredicateEnrichmentConfig, enrich_numeric_bin_predicates
 from pattern_bn import PatternBayesianNetwork, PatternBNConfig
-from pattern_extension import GraphSpawn
+from pattern_extension import GraphSpawn, topology_pattern_code
+from vf3_linux import find_matches_with_limit
+from vf3_like import find_matches_with_limit as find_matches_with_limit_like
 from predicate_bn import PredicateBayesianNetwork, PredicateBNConfig
 from predicate_selection import DecisionTreePredicateSelector, FPGrowthPredicateSelector, Rule
 from rulegeneration import (
@@ -35,6 +38,80 @@ GraphLoader = Callable[..., object]
 SeedBuilder = Callable[[object], FrequentPattern]
 
 
+def build_undirected_rematch_graph(graph: DataGraph) -> tuple[DataGraph, dict[object, object]]:
+    """Build a temporary bidirectional graph for undirected-pattern rematching."""
+
+    rematch_graph = deepcopy(graph)
+    reverse_edge_id_map: dict[object, object] = {}
+    existing = {(edge.src, edge.dst, edge.label) for edge in rematch_graph.all_edges()}
+    for edge in list(graph.all_edges()):
+        reverse_key = (edge.dst, edge.src, edge.label)
+        if reverse_key in existing:
+            continue
+        synthetic_edge_id = ("_undirected_reverse", edge.edge_id)
+        reverse_edge_id_map[synthetic_edge_id] = edge.edge_id
+        reverse_attrs = dict(edge.attrs)
+        reverse_attrs["_undirected_reverse"] = True
+        reverse_attrs["_original_edge_id"] = edge.edge_id
+        reverse_edge = replace(
+            edge,
+            edge_id=synthetic_edge_id,
+            src=edge.dst,
+            dst=edge.src,
+            attrs=reverse_attrs,
+        )
+        rematch_graph.out_edges.setdefault(reverse_edge.src, []).append(reverse_edge)
+        rematch_graph.in_edges.setdefault(reverse_edge.dst, []).append(reverse_edge)
+        rematch_graph.edges_by_id[synthetic_edge_id] = reverse_edge
+        existing.add(reverse_key)
+    return rematch_graph, reverse_edge_id_map
+
+
+def normalize_undirected_rematch_instances(
+    instances: List[GraphInstance],
+    original_graph: DataGraph,
+    reverse_edge_id_map: dict[object, object],
+) -> List[GraphInstance]:
+    """Map synthetic reverse edges back to their original edge ids."""
+
+    normalized: List[GraphInstance] = []
+    for instance in instances:
+        edge_bindings = {
+            pattern_edge_index: reverse_edge_id_map.get(edge_id, edge_id)
+            for pattern_edge_index, edge_id in instance.edge_bindings.items()
+        }
+        edge_triplets = []
+        for edge_id in edge_bindings.values():
+            edge = original_graph.edges_by_id.get(edge_id)
+            if edge is not None:
+                edge_triplets.append((edge.src, edge.dst, edge.label))
+        normalized.append(
+            GraphInstance(
+                node_map=dict(instance.node_map),
+                edge_ids=tuple(sorted(edge_triplets)),
+                pivot=instance.pivot,
+                edge_bindings=edge_bindings,
+            )
+        )
+    return normalized
+
+
+def dedupe_rematch_instances(instances: List[GraphInstance]) -> List[GraphInstance]:
+    """Remove duplicate embeddings introduced by temporary reverse edges."""
+
+    seen = set()
+    deduped: List[GraphInstance] = []
+    for instance in instances:
+        key = (
+            tuple(sorted(instance.node_map.items())),
+            tuple(sorted(instance.edge_bindings.items(), key=lambda item: (item[0], str(item[1])))),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(instance)
+    return deduped
+
+
 @dataclass
 class GarplusRunConfig:
     dataset_name: str
@@ -58,10 +135,17 @@ class GarplusRunConfig:
     y_key: str = "e0.interaction_label"
     target_y_keys: Optional[List[str]] = None
     include_ml_predicate_targets: bool = True
+    pattern_extension_only: bool = False
+    pattern_extension_debug: bool = False
+    pattern_extension_debug_limit: int = 500
+    global_rematch_patterns: bool = True
+    global_vspawn_instances: bool = False
     decision_tree_max_depth: int = 3
     max_rows: int = 50
     undirected: bool = True
     undirected_pattern: bool = True
+    topology_only_pattern_dedup: bool = False
+    topology_dedupe_respect_direction: bool = False
     full_solution: bool = False
     pattern_support: int = 5
     min_support: int = 50
@@ -70,7 +154,8 @@ class GarplusRunConfig:
     max_radius: int = 4
     max_add_edge: int = 4
     node_max_add_edge: int = 4
-    max_multi_support: int = 10000
+    max_multi_support: Optional[int] = 10000
+    pattern_dedup_prefer_target_value: Optional[str] = None
     print_rule_limit: int = 10
     print_deduped_rule_limit: int = 50
     deduped_rules_output_path: Optional[str] = None
@@ -163,57 +248,69 @@ def dedupe_rules_semantically(pattern_rules):
     return rows
 
 
-def compute_rule_closures(deduped_rows) -> dict:
-    implications = []
-    for _pattern_id, _rule, key in deduped_rows:
-        antecedent_key, consequent_key = key
-        implications.append((set(antecedent_key), consequent_key))
-
-    closures = {}
-    for _pattern_id, _rule, key in deduped_rows:
-        antecedent_key, _consequent_key = key
-        closure = set(antecedent_key)
-        changed = True
-        while changed:
-            changed = False
-            for lhs, rhs in implications:
-                if lhs.issubset(closure) and rhs not in closure:
-                    closure.add(rhs)
-                    changed = True
-        closures[key] = tuple(sorted(closure))
-    return closures
+def rule_is_entailed(rule_key, other_rule_keys) -> bool:
+    antecedent_key, consequent_key = rule_key
+    closure = set(antecedent_key)
+    if consequent_key in closure:
+        return True
+    changed = True
+    while changed:
+        changed = False
+        for other_antecedent, other_consequent in other_rule_keys:
+            if set(other_antecedent).issubset(closure) and other_consequent not in closure:
+                closure.add(other_consequent)
+                changed = True
+                if consequent_key in closure:
+                    return True
+    return False
 
 
-def format_deduped_rule_row(pattern_id, rule, key, closure=None) -> str:
+def compute_rule_cover(deduped_rows):
+    """Return an irredundant rule subset equivalent under forward implication."""
+
+    cover = list(deduped_rows)
+    weakest_first = sorted(
+        deduped_rows,
+        key=lambda item: (float(item[1].confidence), float(item[1].support), float(item[1].lift)),
+    )
+    for candidate in weakest_first:
+        if candidate not in cover:
+            continue
+        candidate_key = candidate[2]
+        other_keys = [row[2] for row in cover if row is not candidate]
+        if rule_is_entailed(candidate_key, other_keys):
+            cover.remove(candidate)
+    cover.sort(key=lambda item: (float(item[1].confidence), float(item[1].support), float(item[1].lift)), reverse=True)
+    return cover
+
+
+def format_deduped_rule_row(pattern_id, rule, key) -> str:
     antecedent_key, consequent_key = key
-    closure_text = f" closure={closure}" if closure is not None else ""
     return (
-        "  deduped_rule "
+        "  cover_rule "
         f"pattern_id={pattern_id} antecedent={antecedent_key} consequent={consequent_key} "
         f"raw_antecedent={rule.antecedent} raw_consequent={rule.consequent} "
         f"support={int(rule.support)} confidence={rule.confidence:.3f} lift={rule.lift:.3f}"
-        f"{closure_text}"
     )
 
 
-def _print_deduped_rule_row(pattern_id, rule, key, closure=None) -> None:
-    print(format_deduped_rule_row(pattern_id, rule, key, closure=closure))
+def _print_deduped_rule_row(pattern_id, rule, key) -> None:
+    print(format_deduped_rule_row(pattern_id, rule, key))
 
 
-def write_deduped_rules(path: str, deduped_rows, closures=None) -> None:
+def write_deduped_rules(path: str, deduped_rows) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         for pattern_id, rule, key in deduped_rows:
-            closure = closures.get(key) if closures else None
-            handle.write(format_deduped_rule_row(pattern_id, rule, key, closure=closure).strip() + "\n")
+            handle.write(format_deduped_rule_row(pattern_id, rule, key).strip() + "\n")
 
 
 def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = None):
     deduped = dedupe_rules_semantically(pattern_rules)
-    closures = compute_rule_closures(deduped)
+    cover = compute_rule_cover(deduped)
     grouped = {"positive": [], "negative": [], "other": []}
-    for row in deduped:
+    for row in cover:
         _pattern_id, rule, _key = row
         value = _rule_consequent_value(rule)
         if value == "positive":
@@ -224,18 +321,19 @@ def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = 
             grouped["other"].append(row)
 
     print(
-        f"[DedupedRules] raw={len(pattern_rules)} unique={len(deduped)} limit_per_group={limit} "
+        f"[RuleCover] raw={len(pattern_rules)} deduped={len(deduped)} cover={len(cover)} "
+        f"redundant_removed={len(deduped) - len(cover)} limit_per_group={limit} "
         f"positive={len(grouped['positive'])} negative={len(grouped['negative'])} other={len(grouped['other'])}"
     )
     for group_name in ("positive", "negative", "other"):
         rows = grouped[group_name]
-        print(f"[DedupedRules/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
+        print(f"[RuleCover/{group_name}] count={len(rows)} shown={min(len(rows), limit)}")
         for pattern_id, rule, key in rows[:limit]:
-            _print_deduped_rule_row(pattern_id, rule, key, closure=closures.get(key))
+            _print_deduped_rule_row(pattern_id, rule, key)
     if output_path:
-        write_deduped_rules(output_path, deduped, closures=closures)
-        print(f"[DedupedRules] wrote={len(deduped)} path={output_path}")
-    return deduped
+        write_deduped_rules(output_path, cover)
+        print(f"[RuleCover] wrote={len(cover)} path={output_path}")
+    return cover
 
 
 def rule_consequent_distribution(rules) -> dict:
@@ -484,6 +582,41 @@ def print_rule_candidate_diagnostics(selector, limit: int = 20) -> None:
     print_target_rule_diagnostics(selector, "positive", limit=limit)
 
 
+def print_target_row_diagnostics(selector, focus_item: Optional[str] = None) -> None:
+    summary = getattr(selector, "target_stage_summary", None) or {}
+    if not summary:
+        return
+    print(
+        "[TargetRows] "
+        f"y_key={summary.get('y_key')} raw_rows={summary.get('raw_rows')} "
+        f"raw_counts={summary.get('raw_counts')} "
+        f"after_value_rows={summary.get('after_value_rows')} "
+        f"after_value_counts={summary.get('after_value_counts')} "
+        f"missing_target_after_value_pruning={summary.get('missing_target_after_value_pruning')} "
+        f"ignored_counts={summary.get('ignored_counts')} "
+        f"after_ignored_rows={summary.get('after_ignored_rows')} "
+        f"after_ignored_counts={summary.get('after_ignored_counts')}"
+    )
+    if not focus_item or "=" not in focus_item:
+        return
+    _focus_key, focus_value = focus_item.split("=", 1)
+    raw_count = int(summary.get("raw_counts", {}).get(focus_value, 0))
+    after_value_count = int(summary.get("after_value_counts", {}).get(focus_value, 0))
+    after_ignored_count = int(summary.get("after_ignored_counts", {}).get(focus_value, 0))
+    if raw_count == 0:
+        reason = "no_matched_instances_with_target_value"
+    elif after_value_count == 0:
+        reason = "target_value_removed_by_min_value_support"
+    elif after_ignored_count == 0:
+        reason = "target_value_removed_by_ignored_target_values"
+    else:
+        reason = "target_value_available_for_itemset_mining"
+    print(
+        f"[TargetFocusAvailability] focus={focus_item} raw={raw_count} "
+        f"after_value={after_value_count} after_ignored={after_ignored_count} reason={reason}"
+    )
+
+
 def print_negative_rule_diagnostics(selector, limit: int = 20) -> None:
     print_target_rule_diagnostics(selector, "negative", limit=limit)
 
@@ -641,6 +774,14 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         f"pattern_top_k={cfg.pattern_bn_top_k_per_spawn_node} pattern_min_keep={cfg.pattern_bn_min_keep_per_spawn_node}"
     )
     print(f"[BN] pattern_bn={cfg.enable_pattern_bn} predicate_bn={cfg.enable_predicate_bn}")
+    print(
+        f"[PatternDebug] only={cfg.pattern_extension_only} enabled={cfg.pattern_extension_debug} "
+        f"event_limit={cfg.pattern_extension_debug_limit}"
+    )
+    print(
+        f"[PatternMatching] global_rematch_patterns={cfg.global_rematch_patterns} "
+        f"global_vspawn_instances={cfg.global_vspawn_instances}"
+    )
     print(f"[Targets] include_ml_predicate_targets={cfg.include_ml_predicate_targets}")
     print(f"[PatternMode] undirected_pattern={cfg.undirected_pattern}")
 
@@ -648,14 +789,16 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     if cfg.drop_ignored_target_edges:
         drop_summary = drop_edges_by_target_values(graph, cfg.ignored_target_values)
         print(f"[TargetEdgeFilter] {drop_summary}")
-    ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
-    if ml_summary.get("enabled"):
-        print(f"[MLPredicate] {ml_summary}")
-    enrichment_summary = enrich_numeric_bin_predicates(graph, cfg.predicate_enrichment)
-    if enrichment_summary.get("enabled"):
-        print(f"[PredicateEnrichment] {enrichment_summary}")
-    target_y_list = build_target_y_list(graph, cfg)
-    print(f"[YList] targets={target_y_list}")
+    target_y_list = []
+    if not cfg.pattern_extension_only:
+        ml_summary = inject_ml_predicates(graph, cfg.dataset_name, cfg.ml_predicates)
+        if ml_summary.get("enabled"):
+            print(f"[MLPredicate] {ml_summary}")
+        enrichment_summary = enrich_numeric_bin_predicates(graph, cfg.predicate_enrichment)
+        if enrichment_summary.get("enabled"):
+            print(f"[PredicateEnrichment] {enrichment_summary}")
+        target_y_list = build_target_y_list(graph, cfg)
+        print(f"[YList] targets={target_y_list}")
     isolated_vertices = sum(1 for node_id in graph.vertices if not graph.out_edges.get(node_id) and not graph.in_edges.get(node_id))
     print(
         f"[Graph] vertices={len(graph.vertices)} out_edge_lists={sum(len(v) for v in graph.out_edges.values())} "
@@ -711,6 +854,12 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             node_max_add_edge=cfg.node_max_add_edge,
             full_solution=cfg.full_solution,
             max_multi_support=cfg.max_multi_support,
+            undirected_pattern=cfg.undirected_pattern,
+            topology_only_dedup=cfg.topology_only_pattern_dedup,
+            topology_dedupe_respect_direction=cfg.topology_dedupe_respect_direction,
+            global_vspawn_instances=cfg.global_vspawn_instances,
+            extension_debug=cfg.pattern_extension_debug,
+            extension_debug_limit=cfg.pattern_extension_debug_limit,
         ),
         pattern_bn=pattern_bn,
     )
@@ -751,11 +900,84 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     if not generated:
         raise RuntimeError("No pattern generated. Try lowering pattern_support or increasing max_radius/max_add_edge.")
 
+    if cfg.global_rematch_patterns:
+        # VSpawn may use capped parent embeddings for fast structural exploration.
+        # Rebuild every candidate's instances globally before rule mining.
+        rematch_limit = None if (cfg.full_solution or cfg.global_vspawn_instances) else cfg.max_multi_support
+        if cfg.dataset_name.upper() == "PPI" and cfg.undirected_pattern:
+            rematch_graph, reverse_edge_id_map = build_undirected_rematch_graph(graph)
+            print(
+                "[GlobalRematchGraph] mode=undirected_bidirectional_copy "
+                f"synthetic_reverse_edges={len(reverse_edge_id_map)}"
+            )
+        else:
+            rematch_graph = graph
+            reverse_edge_id_map = {}
+        globally_matched = []
+        for item in generated:
+            previous_multi_support = item.multi_support()
+            matches = find_matches_with_limit(item.pattern, rematch_graph, rematch_limit)
+            match_backend = "vf3_linux"
+            # The installed vf3py backend has returned empty results for valid
+            # multi-edge PPI embeddings. Use the pure-Python matcher only as a
+            # correctness fallback; it is slower but follows our VSpawn semantics.
+            if (
+                not matches
+                and item.pattern.edge_count() > 1
+                and cfg.dataset_name.upper() == "PPI"
+                and cfg.undirected_pattern
+            ):
+                matches = find_matches_with_limit_like(item.pattern, rematch_graph, rematch_limit)
+                match_backend = "vf3_like_fallback"
+            if reverse_edge_id_map:
+                matches = normalize_undirected_rematch_instances(matches, graph, reverse_edge_id_map)
+                matches = dedupe_rematch_instances(matches)
+            single_support = len({match.pivot for match in matches if match.pivot is not None}) or len(matches)
+            if single_support < cfg.pattern_support:
+                print(
+                    f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=False "
+                    f"backend={match_backend} "
+                    f"incremental_multi={previous_multi_support} global_multi={len(matches)} "
+                    f"global_single={single_support} reason=support<{cfg.pattern_support}"
+                )
+                continue
+            rematched = FrequentPattern(
+                pattern=item.pattern,
+                instances=matches,
+                sampled=not cfg.full_solution,
+                total_single_support=single_support,
+                total_multi_support=len(matches),
+            )
+            globally_matched.append(rematched)
+            print(
+                f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=True "
+                f"backend={match_backend} "
+                f"incremental_multi={previous_multi_support} global_multi={len(matches)} "
+                f"global_single={single_support}"
+            )
+        generated = globally_matched
+        if not generated:
+            raise RuntimeError("No globally matched pattern passed pattern_support.")
+
+    def pattern_representative_rank(item):
+        if not cfg.pattern_dedup_prefer_target_value:
+            return item.single_support(), item.multi_support()
+        preferred_count = 0
+        for instance in item.instances:
+            edge_id = instance.get_edge_id(0)
+            edge = graph.edges_by_id.get(edge_id) if edge_id is not None else None
+            if edge is not None and str(edge.attrs.get("interaction_label")) == cfg.pattern_dedup_prefer_target_value:
+                preferred_count += 1
+        return preferred_count, item.single_support(), item.multi_support()
+
     unique_patterns = {}
     for item in generated:
-        key = item.pattern.undirected_canonical_code() if cfg.undirected_pattern else item.pattern.canonical_code()
+        if cfg.topology_only_pattern_dedup:
+            key = topology_pattern_code(item.pattern, cfg.topology_dedupe_respect_direction)
+        else:
+            key = item.pattern.undirected_canonical_code() if cfg.undirected_pattern else item.pattern.canonical_code()
         current = unique_patterns.get(key)
-        if current is None or (item.single_support(), item.multi_support()) > (current.single_support(), current.multi_support()):
+        if current is None or pattern_representative_rank(item) > pattern_representative_rank(current):
             unique_patterns[key] = item
     patterns_to_mine = sorted(
         unique_patterns.values(),
@@ -764,8 +986,21 @@ def run_demo(cfg: GarplusRunConfig) -> None:
     )
     print(
         f"[Patterns] generated_total={len(generated)} unique_total={len(patterns_to_mine)} "
-        f"deduped={len(generated) - len(patterns_to_mine)} undirected={cfg.undirected_pattern}"
+        f"deduped={len(generated) - len(patterns_to_mine)} undirected={cfg.undirected_pattern} "
+        f"topology_only={cfg.topology_only_pattern_dedup} "
+        f"respect_direction={cfg.topology_dedupe_respect_direction}"
     )
+    if cfg.pattern_extension_only:
+        print(f"\n=== Pattern Extension Results dataset={cfg.dataset_name} ===")
+        for index, item in enumerate(patterns_to_mine, start=1):
+            edges = [(edge.src, edge.dst, edge.label) for edge in item.pattern.edges]
+            print(
+                f"[PatternExtension/Result] index={index}/{len(patterns_to_mine)} "
+                f"pattern_id={item.pattern.pattern_id} nodes={item.pattern.node_labels} edges={edges} "
+                f"radius={item.pattern.radius} single={item.single_support()} multi={item.multi_support()}"
+            )
+        print_bn_summary(pattern_bn, None, cfg)
+        return
 
     total_sent = 0
     all_pattern_rules = []
@@ -858,6 +1093,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         f"focus={focus_item} tokens={cfg.ignored_predicate_key_tokens} dropped_keys={len(dropped_keys)} "
                         f"sample={dropped_keys[:20]}"
                     )
+                print_target_row_diagnostics(selector, focus_item)
                 print_rule_consequent_distribution(focus_rules)
                 print_rule_candidate_diagnostics(selector)
                 focus_results.append((focus_item, selector, focus_rules))

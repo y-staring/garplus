@@ -41,6 +41,7 @@ class PredicateTableMixin:
         self.drop_feature_key_tokens = tuple(token.lower() for token in (drop_feature_key_tokens or ()) if token)
         self.filtered_feature_keys: set[str] = set()
         self.diagnostics: List[Dict[str, object]] = []
+        self.target_stage_summary: Dict[str, object] = {}
 
     def min_support_count(self, total_rows: int) -> int:
         """Convert configured support threshold to paper-style absolute support."""
@@ -52,6 +53,7 @@ class PredicateTableMixin:
     def reset_diagnostics(self) -> None:
         self.diagnostics = []
         self.filtered_feature_keys = set()
+        self.target_stage_summary = {}
 
     def record_diagnostic(self, antecedent: Tuple[str, ...], consequent: str, support: int, confidence: float, lift: float, reason: str) -> None:
         self.diagnostics.append(
@@ -104,6 +106,33 @@ class PredicateTableMixin:
         if not self.drop_target_values:
             return rows
         return [row for row in rows if row.get(y_key) not in self.drop_target_values]
+
+    def prepare_target_rows(self, raw_rows: List[Dict[str, object]], y_key: str) -> List[Dict[str, object]]:
+        """Apply target-preserving preprocessing and retain stage counts for diagnostics."""
+
+        raw_counts = Counter(str(row.get(y_key)) for row in raw_rows if y_key in row)
+        value_pruned_rows = self.prune_rows_by_value_support(raw_rows)
+        target_present_rows = [row for row in value_pruned_rows if y_key in row]
+        after_value_counts = Counter(str(row.get(y_key)) for row in target_present_rows)
+        ignored_counts = Counter(
+            str(row.get(y_key))
+            for row in target_present_rows
+            if row.get(y_key) in self.drop_target_values
+        )
+        filtered_rows = self.filter_target_rows(target_present_rows, y_key)
+        after_ignored_counts = Counter(str(row.get(y_key)) for row in filtered_rows)
+        self.target_stage_summary = {
+            "y_key": y_key,
+            "raw_rows": len(raw_rows),
+            "raw_counts": dict(raw_counts),
+            "after_value_rows": len(target_present_rows),
+            "after_value_counts": dict(after_value_counts),
+            "missing_target_after_value_pruning": len(value_pruned_rows) - len(target_present_rows),
+            "ignored_counts": dict(ignored_counts),
+            "after_ignored_rows": len(filtered_rows),
+            "after_ignored_counts": dict(after_ignored_counts),
+        }
+        return filtered_rows
 
     def is_dropped_feature_key(self, key: str, y_key: Optional[str] = None) -> bool:
         if key == y_key or not self.drop_feature_key_tokens:
@@ -190,10 +219,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
     def generate_literal_df(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
         """Build the per-pattern table and keep only rows that still contain the target."""
 
-        rows = self.build_instance_rows(graph, frequent_pattern)
-        rows = self.prune_rows_by_value_support(rows)
-        rows = [row for row in rows if y_key in row]
-        rows = self.filter_target_rows(rows, y_key)
+        rows = self.prepare_target_rows(self.build_instance_rows(graph, frequent_pattern), y_key)
         return self.filter_feature_keys(rows, y_key)
 
     def generate_scoring_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern, y_key: str) -> List[Dict[str, object]]:
@@ -406,9 +432,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         """Emit association rules whose consequent belongs to the requested target prefix."""
 
         self.reset_diagnostics()
-        rows = self.prune_rows_by_value_support(self.build_instance_rows(graph, frequent_pattern))
-        rows = [row for row in rows if y_prefix in row]
-        rows = self.filter_target_rows(rows, y_prefix)
+        rows = self.prepare_target_rows(self.build_instance_rows(graph, frequent_pattern), y_prefix)
         rows = self.filter_feature_keys(rows, y_prefix)
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_prefix)

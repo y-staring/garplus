@@ -135,10 +135,32 @@ class PatternBayesianNetwork:
     def score_spawn_edge(self, pattern: GraphPattern, spawn_node: int, spawn_edge: SpawnEdge) -> float:
         """Score one candidate expansion from learned pgmpy CPDs."""
 
+        return self.score_spawn_edge_components(pattern, spawn_node, spawn_edge)["final_score"]
+
+    def score_spawn_edge_components(
+        self,
+        pattern: GraphPattern,
+        spawn_node: int,
+        spawn_edge: SpawnEdge,
+    ) -> Dict[str, float]:
+        """Return CPD and sampled-frequency contributions to one spawn score."""
+
         if not self.config.enabled:
-            return 1.0
+            return {
+                "edge_prob": 1.0,
+                "dst_prob": 1.0,
+                "bn_score": 1.0,
+                "frequent_prior": 0.0,
+                "final_score": 1.0,
+            }
         if self.model is None:
-            return 0.0
+            return {
+                "edge_prob": 0.0,
+                "dst_prob": 0.0,
+                "bn_score": 0.0,
+                "frequent_prior": 0.0,
+                "final_score": 0.0,
+            }
         src_label = str(pattern.node_labels[spawn_node])
         direction = str(spawn_edge.direction)
         edge_label = str(spawn_edge.edge_label)
@@ -155,7 +177,20 @@ class PatternBayesianNetwork:
             dst_label,
             {self.SRC_LABEL: src_label, self.DIRECTION: direction, self.EDGE_LABEL: edge_label},
         )
-        return edge_prob * dst_prob
+        bn_score = edge_prob * dst_prob
+        frequent_prior = self._frequent_edge_prior(src_label, dst_label, edge_label)
+        prior_weight = min(1.0, max(0.0, float(self.config.frequent_prior_weight)))
+        if self.config.frequent_edge_priors:
+            final_score = (1.0 - prior_weight) * bn_score + prior_weight * frequent_prior
+        else:
+            final_score = bn_score
+        return {
+            "edge_prob": edge_prob,
+            "dst_prob": dst_prob,
+            "bn_score": bn_score,
+            "frequent_prior": frequent_prior,
+            "final_score": final_score,
+        }
 
     def _frequent_edge_prior(self, src_label: str, dst_label: str, edge_label: str) -> float:
         left, right = sorted([str(src_label), str(dst_label)])
@@ -251,7 +286,6 @@ def _cpd_probability(model, variable: str, state: str, evidence: Dict[str, str])
         return float(values[state_index])
     except Exception:
         return 0.0
-
 
 
 

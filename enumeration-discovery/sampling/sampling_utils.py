@@ -200,10 +200,15 @@ class OrderPairDataset(Dataset):
 
 
 def _ensure_edge_label(data):
-    if hasattr(data, "edge_label") and data.edge_label is not None:
-        return data
-    edge_num = data.edge_index.size(1) if getattr(data, "edge_index", None) is not None else 0
-    data.edge_label = torch.zeros(edge_num, dtype=torch.long)
+    if not hasattr(data, "edge_label") or data.edge_label is None:
+        edge_num = data.edge_index.size(1) if getattr(data, "edge_index", None) is not None else 0
+        data.edge_label = torch.zeros(edge_num, dtype=torch.long)
+
+    # pick_patterns stores this only for final quota selection.  Node-dropping
+    # used by order training creates a new Data object without the attribute;
+    # PyG Batch requires every graph in a batch to expose the same keys.
+    if not hasattr(data, "sampling_center_label") or data.sampling_center_label is None:
+        data.sampling_center_label = torch.zeros(1, dtype=torch.long)
     return data
 
 
