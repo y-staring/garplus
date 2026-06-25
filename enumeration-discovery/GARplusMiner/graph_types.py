@@ -310,7 +310,12 @@ def _iter_literal_values(value: object) -> Iterable[object]:
     return [value]
 
 
-def instance_literals(graph: DataGraph, pattern: GraphPattern, instance: GraphInstance) -> List[LiteralRecord]:
+def instance_literals(
+    graph: DataGraph,
+    pattern: GraphPattern,
+    instance: GraphInstance,
+    debug: bool = False,
+) -> List[LiteralRecord]:
     """Bridge structural matching and predicate mining.
 
     After pattern matching finds one concrete `(pattern -> graph)` mapping, this function
@@ -340,6 +345,15 @@ def instance_literals(graph: DataGraph, pattern: GraphPattern, instance: GraphIn
         for key, value in edge.attrs.items():
             for one in _iter_literal_values(value):
                 records.append(LiteralRecord(key=key, value=one, entity=f"e{pattern_edge_index}"))
+    if debug:
+        node_records = [record for record in records if record.entity.startswith("v")]
+        edge_records = [record for record in records if record.entity.startswith("e")]
+        print(
+            f"[InstanceLiteralSummary] pattern_id={pattern.pattern_id} "
+            f"node_count={len(node_records)} edge_count={len(edge_records)}"
+        )
+        print(f"  node_keys={sorted({record.key for record in node_records})[:50]}")
+        print(f"  edge_keys={sorted({record.key for record in edge_records})[:50]}")
     return records
 
 

@@ -39,6 +39,8 @@ class PredicateEnrichmentConfig:
     edge_numeric_keys: Optional[tuple[str, ...]] = None
     add_pair_equal_bins: bool = True
     max_pair_equal_bin_keys: int = 20
+    inference_edge_predicates: bool = False
+    inference_presence_key: Optional[str] = None
 
 
 def _clean_key(key: object) -> str:
@@ -160,6 +162,26 @@ def enrich_numeric_bin_predicates(graph: DataGraph, cfg: PredicateEnrichmentConf
                 edge.attrs[f"same_{key}_bin"] = same
                 pair_equal_counts[f"same_{key}_bin={same}"] += 1
 
+    inference_predicate_counts: Counter = Counter()
+    if cfg.inference_edge_predicates:
+        score_values = [_to_float(edge.attrs.get("inferencescore")) for edge in graph.all_edges()]
+        score_low, score_high = _thresholds([value for value in score_values if value is not None], cfg.quantiles)
+        for edge in graph.all_edges():
+            attrs = edge.attrs
+            direct = str(attrs.pop("directevidence", "")).strip().lower()
+            direct_value = "inference_evidence" if not direct or direct in MISSING_VALUES else ("marker_mechanism" if direct == "marker/mechanism" else "other")
+            attrs["direct_evidence_category"] = direct_value
+            inference_predicate_counts[f"direct_evidence_category={direct_value}"] += 1
+            if cfg.inference_presence_key:
+                raw = str(attrs.pop(cfg.inference_presence_key, "")).strip().lower()
+                value = "no" if not raw or raw in MISSING_VALUES else "yes"
+                predicate_key = "inference_gene_present" if cfg.inference_presence_key == "inferencegenesymbol" else "inference_chemical_present"
+                attrs[predicate_key] = value
+                inference_predicate_counts[f"{predicate_key}={value}"] += 1
+            score_bin = _bin_value(attrs.pop("inferencescore", None), score_low, score_high) or "missing"
+            attrs["inference_score_bin"] = score_bin
+            inference_predicate_counts[f"inference_score_bin={score_bin}"] += 1
+
     return {
         "enabled": True,
         "node_numeric_keys": node_keys,
@@ -169,4 +191,5 @@ def enrich_numeric_bin_predicates(graph: DataGraph, cfg: PredicateEnrichmentConf
         "node_bin_counts": {key: dict(counts) for key, counts in node_bin_counts.items()},
         "edge_bin_counts": {key: dict(counts) for key, counts in edge_bin_counts.items()},
         "pair_equal_counts": dict(pair_equal_counts),
+        "inference_edge_predicates": dict(inference_predicate_counts),
     }

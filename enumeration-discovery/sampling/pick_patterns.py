@@ -72,7 +72,7 @@ NEGATIVE_CENTER_RATIO = 0.5
 SELECTED_NEGATIVE_CENTER_RATIO = 0.5
 # PyG reuses the existing *_raw.pt by default.  Set this to True only when you
 # want the script to delete that cache and regenerate the raw pool.
-FORCE_RESAMPLE_RAW_POOL = False
+FORCE_RESAMPLE_RAW_POOL = True
 INCLUDE_POSITIVE_EDGE_CENTERS = True
 INTERACTION_LABEL_COL = "interaction_label"
 NEGATIVE_LABEL = "negative"
@@ -733,7 +733,7 @@ def main(argv=None):
     encoder_path = os.path.join(processed_dir, encoder_filename)
     emb_path = os.path.join(processed_dir, emb_filename)
     selected_path = os.path.join(processed_dir, selected_filename)
-    raw_path = os.path.join(processed_dir, raw_filename)
+    raw_path = os.path.join(processed_dir, "processed",raw_filename)
 
     if not 0.0 <= SELECTED_NEGATIVE_CENTER_RATIO <= 1.0:
         raise ValueError("SELECTED_NEGATIVE_CENTER_RATIO must be within [0, 1]")

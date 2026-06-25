@@ -1,7 +1,7 @@
 import torch
 
-PT_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/ti/ti_selected.pt"
-# PT_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/ppi/ppi_selected copy.pt"
+PT_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/dda/dda_selected.pt"
+
 data, slices = torch.load(PT_PATH, map_location="cpu")
 
 # 1=negative，2=positive，3=neutral，0=unknown

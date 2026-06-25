@@ -13,6 +13,9 @@ def find_matches_with_limit(
     graph: DataGraph,
     limit: Optional[int] = None,
     pivot_candidates: Optional[List[int]] = None,
+    target_edge_index: Optional[int] = None,
+    max_instances_per_target_edge: Optional[int] = None,
+    target_edge_undirected: bool = False,
 ) -> List[GraphInstance]:
     """Enumerate directed embeddings and retain a distinct binding for each edge id."""
 
@@ -31,6 +34,13 @@ def find_matches_with_limit(
     results: List[GraphInstance] = []
     mapping: Dict[int, int] = {}
     used_nodes = set()
+    target_edge_counts: Dict[Tuple[int, int, object], int] = {}
+
+    def target_key(edge_id: int) -> Tuple[int, int, object]:
+        edge = graph.edges_by_id[edge_id]
+        if target_edge_undirected:
+            return min(edge.src, edge.dst), max(edge.src, edge.dst), edge.label
+        return edge.src, edge.dst, edge.label
 
     def has_grounded_edges() -> bool:
         for edge in pattern.edges:
@@ -55,6 +65,14 @@ def find_matches_with_limit(
                 return True
             if index == len(choices):
                 edge_bindings = dict(bindings)
+                counted_target_key = None
+                if target_edge_index is not None and max_instances_per_target_edge is not None:
+                    target_edge_id = edge_bindings.get(target_edge_index)
+                    if target_edge_id is None:
+                        return False
+                    counted_target_key = target_key(target_edge_id)
+                    if target_edge_counts.get(counted_target_key, 0) >= max_instances_per_target_edge:
+                        return False
                 edge_ids = tuple(
                     sorted(
                         (graph.edges_by_id[edge_id].src, graph.edges_by_id[edge_id].dst, graph.edges_by_id[edge_id].label)
@@ -69,6 +87,8 @@ def find_matches_with_limit(
                         edge_bindings=edge_bindings,
                     )
                 )
+                if counted_target_key is not None:
+                    target_edge_counts[counted_target_key] = target_edge_counts.get(counted_target_key, 0) + 1
                 return False
             pattern_edge_index, candidates = choices[index]
             for edge in candidates:
