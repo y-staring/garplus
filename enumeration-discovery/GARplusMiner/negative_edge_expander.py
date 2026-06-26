@@ -9,8 +9,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+import os
 import sys
 import csv
+import random
 import pandas as pd
 
 max_int = sys.maxsize
@@ -20,9 +23,10 @@ while True:
         break
     except OverflowError:
         max_int = int(max_int / 10)
-
 MISSING_LABELS = {"", "unknown", "candidate", "unlabeled", "none", "nan", "na", "n/a"}
 MISSING_VALUES = MISSING_LABELS | {"-", "null", "inf", "-inf"}
+NEUTRAL_LABELS = {"neutral", "netural"}
+
 
 
 # =========================
@@ -39,19 +43,34 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "\u53bb\u75c5\u56fe\u6570\u636e"
 PROCESSED_DIR = BASE_DIR / "processed"
 
-ACTIVE_DATASET = "DDA"
+ACTIVE_DATASET = "PPI"
 LABEL_COLUMN = "interaction_label"
 NEGATIVE_VALUE = "negative"
 SIMILARITY_THRESHOLD = 0.85
-ONLY_LABELS = MISSING_LABELS
+ONLY_LABELS = MISSING_LABELS | NEUTRAL_LABELS | {"positive"}
 OVERWRITE_EXISTING = False
-EXPANSION_MODE = "candidate_non_edges"  # "matched_existing" or "candidate_non_edges"
+ALLOW_POSITIVE_RELABEL = True
+ALLOW_EXISTING_NEGATIVE_RELABEL = False
+EXPANSION_MODE = "candidate_non_edges"  # "existing_edge_labeling", "matched_existing", "candidate_non_edges", or "body_rematch_non_edges"
 MAX_CANDIDATES_PER_ANCHOR = 50
 MAX_NEW_NEG_PER_NODE = 100
 MAX_NEW_NEG_TOTAL = None
+MAX_BODY_MATCHES_PER_RULE = 200000
 MIN_SRC_DEGREE = 1
 MIN_DST_DEGREE = 1
 REQUIRE_RULE_HAS_PAIR_OR_CONTEXT = True
+
+COMPUTABLE_VIRTUAL_E0_ATTRS = {
+    "ml_similarity_pred",
+    "similarity_pred",
+    "similarity_score",
+    "common_neighbor_bin",
+    "common_neighbor_count",
+}
+
+
+def configured_only_labels() -> Optional[set[str]]:
+    return None if ONLY_LABELS is None else set(ONLY_LABELS)
 
 
 @dataclass(frozen=True)
@@ -86,10 +105,13 @@ class ExpansionConfig:
     similarity_threshold: float = SIMILARITY_THRESHOLD
     only_labels: Optional[set[str]] = None
     overwrite_existing: bool = OVERWRITE_EXISTING
+    allow_positive_relabel: bool = ALLOW_POSITIVE_RELABEL
+    allow_existing_negative_relabel: bool = ALLOW_EXISTING_NEGATIVE_RELABEL
     expansion_mode: str = EXPANSION_MODE
     max_candidates_per_anchor: int = MAX_CANDIDATES_PER_ANCHOR
     max_new_neg_per_node: int = MAX_NEW_NEG_PER_NODE
     max_new_neg_total: Optional[int] = MAX_NEW_NEG_TOTAL
+    max_body_matches_per_rule: int = MAX_BODY_MATCHES_PER_RULE
     min_src_degree: int = MIN_SRC_DEGREE
     min_dst_degree: int = MIN_DST_DEGREE
     require_rule_has_pair_or_context: bool = REQUIRE_RULE_HAS_PAIR_OR_CONTEXT
@@ -99,38 +121,45 @@ DATASET_CONFIGS = {
     "PPI": ExpansionConfig(
         dataset_name="PPI",
         input_csv=DATA_DIR / "protein_protein_signed.csv",
-        output_csv=PROCESSED_DIR / "ppi" / "rule_negative_pairs.csv",
+        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
+        if (EXPANSION_MODE == "existing_edge_labeling") 
+        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
         rules_file=PROCESSED_DIR / "ppi" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ppi" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "protein.csv",
         target_node_csv=DATA_DIR / "protein.csv",
         src_column="index_A",
         dst_column="index_B",
-        only_labels=set(ONLY_LABELS),
+        only_labels=configured_only_labels(),
     ),
     "DDA": ExpansionConfig(
         dataset_name="DDA",
         input_csv=DATA_DIR / "drug_disease_signed.csv",
-        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
+        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
+        if (EXPANSION_MODE == "existing_edge_labeling") 
+        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
         rules_file=PROCESSED_DIR / "dda" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "dda" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "drug.csv",
         target_node_csv=DATA_DIR / "disease.csv",
         src_column="chemical_index",
         dst_column="disease_index",
-        only_labels=set(ONLY_LABELS),
+        only_labels=configured_only_labels(),
     ),
     "TI": ExpansionConfig(
         dataset_name="TI",
         input_csv=DATA_DIR / "gene_disease_signed.csv",
-        output_csv=PROCESSED_DIR / "ti" / "rule_negative_pairs.csv",
+        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
+        if (EXPANSION_MODE == "existing_edge_labeling") 
+        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
+
         rules_file=PROCESSED_DIR / "ti" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ti" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "gene.csv",
         target_node_csv=DATA_DIR / "disease.csv",
         src_column="gene_index",
         dst_column="disease_index",
-        only_labels=set(ONLY_LABELS),
+        only_labels=configured_only_labels(),
     ),
 }
 
@@ -298,6 +327,115 @@ def load_pattern_instances(path: Path) -> dict[int, list[dict]]:
     return result
 
 
+def _value_from_mapping(item: object, keys: tuple[str, ...]) -> str:
+    if not isinstance(item, dict):
+        return normalize_value(item)
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return normalize_value(value)
+    return ""
+
+
+def _node_id_from_instance_value(value: object) -> str:
+    return _value_from_mapping(value, ("index", "node_index", "id", "node_id", "src_index", "dst_index"))
+
+
+def _edge_endpoint(edge_info: dict, endpoint: str) -> str:
+    if endpoint == "src":
+        return _value_from_mapping(edge_info, ("src_index", "src_id", "src", "source", "from"))
+    return _value_from_mapping(edge_info, ("dst_index", "dst_id", "dst", "target", "to"))
+
+
+def infer_pattern_schema_from_instances(instances_by_pattern: dict[int, list[dict]]) -> dict[int, dict[str, tuple[str, str]]]:
+    """Recover edge_var -> (src_node_var, dst_node_var) from saved pattern embeddings.
+
+    The miner stores node bindings and edge endpoint ids in each instance.  We
+    reverse the node id mapping and use it to turn every e0/e1/... edge endpoint
+    back into v0/v1/... variables.  If one instance is incomplete, another
+    instance of the same pattern may still recover the schema.
+    """
+
+    schemas: dict[int, dict[str, tuple[str, str]]] = {}
+    for pattern_id, instances in instances_by_pattern.items():
+        for instance in instances:
+            nodes = instance.get("nodes") or {}
+            edges = instance.get("edges") or {}
+            if not isinstance(nodes, dict) or not isinstance(edges, dict):
+                continue
+
+            id_to_node_var: dict[str, str] = {}
+            for node_var, node_value in nodes.items():
+                node_id = _node_id_from_instance_value(node_value)
+                if node_id:
+                    id_to_node_var[node_id] = str(node_var)
+            if not id_to_node_var:
+                continue
+
+            schema: dict[str, tuple[str, str]] = {}
+            for edge_var, edge_info in edges.items():
+                if not isinstance(edge_info, dict):
+                    continue
+                src_id = _edge_endpoint(edge_info, "src")
+                dst_id = _edge_endpoint(edge_info, "dst")
+                src_var = id_to_node_var.get(src_id) or (src_id if src_id in nodes else None)
+                dst_var = id_to_node_var.get(dst_id) or (dst_id if dst_id in nodes else None)
+                if src_var and dst_var:
+                    schema[str(edge_var)] = (src_var, dst_var)
+            if schema:
+                schemas[pattern_id] = schema
+                break
+    return schemas
+
+
+def group_literals_by_entity(literals: tuple[str, ...]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for literal in literals:
+        key, _op, _expected = split_literal(literal)
+        if "." not in key:
+            continue
+        entity, _attr = key.split(".", 1)
+        grouped.setdefault(entity, []).append(literal)
+    return grouped
+
+
+def rule_expandable_by_body_rematch(
+    rule: NegativeExpansionRule,
+    schema: dict[str, tuple[str, str]],
+    target_edge_var: str,
+) -> bool:
+    if rule.negative_label != "negative":
+        return False
+    if consequent_target_edge(rule) != target_edge_var:
+        return False
+    if target_edge_var not in schema:
+        return False
+
+    body_edge_vars = [edge_var for edge_var in schema if edge_var != target_edge_var]
+    if not body_edge_vars:
+        return False
+
+    target_src_var, target_dst_var = schema[target_edge_var]
+    bound_by_body = {node_var for edge_var in body_edge_vars for node_var in schema[edge_var]}
+    if target_src_var not in bound_by_body or target_dst_var not in bound_by_body:
+        return False
+
+    grouped = group_literals_by_entity(rule.antecedent)
+    has_context_edge_literal = any(
+        entity != target_edge_var and re.fullmatch(r"e[1-9]\d*", entity)
+        for entity in grouped
+    )
+    if not has_context_edge_literal:
+        return False
+
+    for literal in grouped.get(target_edge_var, []):
+        key, _op, _expected = split_literal(literal)
+        _entity, attr = key.split(".", 1)
+        if normalize_key(attr) not in COMPUTABLE_VIRTUAL_E0_ATTRS:
+            return False
+    return True
+
+
 def build_edge_attr_index(
     rows: list[dict[str, str]],
     src_column: str,
@@ -346,6 +484,31 @@ def build_edge_attr_index(
         if dataset_name == "PPI" and src != dst:
             index[(dst, src)] = attrs
     return index
+
+
+def build_edge_records(
+    rows: list[dict[str, str]],
+    src_column: str,
+    dst_column: str,
+    dataset_name: str,
+) -> list[dict[str, object]]:
+    """Build real graph edge records used by body rematching.
+
+    For PPI we treat the graph as undirected and insert the reverse direction so
+    the matcher can satisfy either orientation stored in a pattern schema.
+    """
+
+    attr_index = build_edge_attr_index(rows, src_column, dst_column, dataset_name)
+    records: list[dict[str, object]] = []
+    for row in rows:
+        src, dst = endpoint_ids(row, src_column, dst_column)
+        if not src or not dst:
+            continue
+        attrs = dict(attr_index.get((src, dst), {}))
+        records.append({"src": src, "dst": dst, "attrs": attrs, "row": row})
+        if dataset_name == "PPI" and src != dst:
+            records.append({"src": dst, "dst": src, "attrs": attrs, "row": row})
+    return records
 
 
 def pattern_context_from_instance(
@@ -606,6 +769,191 @@ def rule_matches(rule: NegativeExpansionRule, context: dict[str, dict[str, str]]
     return all(literal_matches(literal, context) for literal in rule.antecedent)
 
 
+def rule_usable_for_existing_edge_labeling(rule: NegativeExpansionRule) -> bool:
+    """Existing-row labeling only has e0/v0/v1/v* context available.
+
+    Structural literals such as e1.xxx need anchored body rematching and are
+    intentionally skipped in this first mode.
+    """
+
+    if rule.negative_label != "negative":
+        return False
+    if consequent_target_edge(rule) != "e0":
+        return False
+    allowed_entities = {"e0", "v0", "v1", "v*"}
+    for literal in rule.antecedent:
+        try:
+            key, _op, _expected = split_literal(literal)
+        except ValueError:
+            return False
+        if "." not in key:
+            return False
+        entity, _attr = key.split(".", 1)
+        if entity not in allowed_entities:
+            return False
+    return True
+
+
+def is_structural_negative_e0_rule(rule: NegativeExpansionRule) -> bool:
+    if rule.negative_label != "negative" or consequent_target_edge(rule) != "e0":
+        return False
+    for literal in rule.antecedent:
+        try:
+            key, _op, _expected = split_literal(literal)
+        except ValueError:
+            continue
+        if "." not in key:
+            continue
+        entity, _attr = key.split(".", 1)
+        if re.fullmatch(r"e[1-9]\d*", entity):
+            return True
+    return False
+
+
+def _record_attr_matches(attrs: dict[str, str], literal: str) -> bool:
+    key, op, expected = split_literal(literal)
+    if "." not in key:
+        return False
+    _entity, attr = key.split(".", 1)
+    actual = attrs.get(normalize_key(attr), "")
+    if op == "=":
+        return actual == expected
+    if op == "!=":
+        return actual != "" and actual != expected
+    return False
+
+
+def edge_record_matches_literals(edge_record: dict[str, object], literals: list[str]) -> bool:
+    attrs = edge_record.get("attrs")
+    if not isinstance(attrs, dict):
+        return False
+    return all(_record_attr_matches(attrs, literal) for literal in literals)
+
+
+def node_satisfies_literals(
+    node_var: str,
+    node_id: str,
+    node_literals: dict[str, list[str]],
+    source_node_attrs: dict[str, dict[str, str]],
+    target_node_attrs: dict[str, dict[str, str]],
+) -> bool:
+    attrs = {"index": normalize_value(node_id), "node_index": normalize_value(node_id)}
+    for table in (source_node_attrs, target_node_attrs):
+        for key, value in table.get(node_id, {}).items():
+            attrs.setdefault(key, value)
+    for literal in node_literals.get(node_var, []):
+        if not _record_attr_matches(attrs, literal):
+            return False
+    return True
+
+
+def body_match_backtracking(
+    schema: dict[str, tuple[str, str]],
+    target_edge_var: str,
+    rule: NegativeExpansionRule,
+    edge_records: list[dict[str, object]],
+    source_node_attrs: dict[str, dict[str, str]],
+    target_node_attrs: dict[str, dict[str, str]],
+    dataset_name: str,
+    max_body_matches_per_rule: int = 200000,
+) -> list[dict[str, dict]]:
+    """Match rule body after removing the head edge from the pattern schema."""
+
+    _dataset_name = dataset_name
+    grouped = group_literals_by_entity(rule.antecedent)
+    body_edge_vars = [edge_var for edge_var in schema if edge_var != target_edge_var]
+    edge_literals = {edge_var: grouped.get(edge_var, []) for edge_var in body_edge_vars}
+    node_literals = {entity: literals for entity, literals in grouped.items() if entity.startswith("v")}
+
+    candidates_by_edge_var: dict[str, list[dict[str, object]]] = {}
+    for edge_var in body_edge_vars:
+        literals = edge_literals.get(edge_var, [])
+        candidates_by_edge_var[edge_var] = [
+            record for record in edge_records if edge_record_matches_literals(record, literals)
+        ]
+        if not candidates_by_edge_var[edge_var]:
+            return []
+
+    ordered_edge_vars = sorted(body_edge_vars, key=lambda edge_var: len(candidates_by_edge_var[edge_var]))
+    matches: list[dict[str, dict]] = []
+
+    def bind_node(node_binding: dict[str, str], node_var: str, node_id: str) -> Optional[dict[str, str]]:
+        node_id = normalize_value(node_id)
+        if not node_id:
+            return None
+        existing = node_binding.get(node_var)
+        if existing is not None:
+            return node_binding if existing == node_id else None
+        if not node_satisfies_literals(node_var, node_id, node_literals, source_node_attrs, target_node_attrs):
+            return None
+        next_binding = dict(node_binding)
+        next_binding[node_var] = node_id
+        return next_binding
+
+    def dfs(position: int, node_binding: dict[str, str], edge_binding: dict[str, dict]) -> None:
+        if len(matches) >= max_body_matches_per_rule:
+            return
+        if position >= len(ordered_edge_vars):
+            matches.append({"node_binding": dict(node_binding), "edge_binding": dict(edge_binding)})
+            return
+
+        edge_var = ordered_edge_vars[position]
+        src_var, dst_var = schema[edge_var]
+        for record in candidates_by_edge_var[edge_var]:
+            src = normalize_value(record.get("src"))
+            dst = normalize_value(record.get("dst"))
+            next_nodes = bind_node(node_binding, src_var, src)
+            if next_nodes is None:
+                continue
+            next_nodes = bind_node(next_nodes, dst_var, dst)
+            if next_nodes is None:
+                continue
+            next_edges = dict(edge_binding)
+            next_edges[edge_var] = record
+            dfs(position + 1, next_nodes, next_edges)
+            if len(matches) >= max_body_matches_per_rule:
+                return
+
+    dfs(0, {}, {})
+    return matches
+
+
+def normalize_pair_for_dataset(src: str, dst: str, dataset_name: str) -> tuple[str, str]:
+    return tuple(sorted((src, dst))) if dataset_name == "PPI" else (src, dst)
+
+
+def virtual_e0_literals_hold(
+    rule: NegativeExpansionRule,
+    src: str,
+    dst: str,
+    dataset_name: str,
+    existing_pair_features: Optional[dict[tuple[str, str], dict[str, str]]] = None,
+) -> bool:
+    grouped = group_literals_by_entity(rule.antecedent)
+    e0_literals = grouped.get(consequent_target_edge(rule), [])
+    if not e0_literals:
+        return True
+
+    pair = normalize_pair_for_dataset(src, dst, dataset_name)
+    features = (existing_pair_features or {}).get(pair, {})
+    for literal in e0_literals:
+        key, op, expected = split_literal(literal)
+        if "." not in key:
+            return False
+        _entity, attr = key.split(".", 1)
+        attr = normalize_key(attr)
+        if attr not in COMPUTABLE_VIRTUAL_E0_ATTRS:
+            return False
+        actual = features.get(attr, "")
+        if actual == "":
+            return False
+        if op == "=" and actual != expected:
+            return False
+        if op == "!=" and actual == expected:
+            return False
+    return True
+
+
 def can_export(row: dict[str, str], label_column: str, allowed_existing: set[str], overwrite_existing: bool) -> bool:
     if overwrite_existing:
         return True
@@ -739,6 +1087,297 @@ def expand_candidate_non_edges(
     }
 
 
+def add_degree_bins_to_node_attrs(
+    rows: list[dict[str, str]],
+    src_column: str,
+    dst_column: str,
+    source_node_attrs: dict[str, dict[str, str]],
+    target_node_attrs: dict[str, dict[str, str]],
+) -> None:
+    node_degree_bins = degree_bins(rows, src_column, dst_column)
+    for table in (source_node_attrs, target_node_attrs):
+        for node_id, attrs in table.items():
+            degree_bin = node_degree_bins.get(node_id, "")
+            attrs.setdefault("degree_bin", degree_bin)
+            attrs.setdefault("degree_bucket", degree_bin)
+
+
+def expand_existing_edges_as_negative(config: ExpansionConfig) -> dict[str, object]:
+    rows, _fields = read_rows(str(config.input_csv))
+    rules = load_rules(config.rules_file)
+    source_node_attrs = load_node_attrs(
+        str(config.source_node_csv) if config.source_node_csv else None,
+        config.source_node_index_column,
+    )
+    target_node_attrs = load_node_attrs(
+        str(config.target_node_csv) if config.target_node_csv else None,
+        config.target_node_index_column,
+    )
+    node_degree_bins = degree_bins(rows, config.src_column, config.dst_column)
+
+    usable_rule_items: list[tuple[int, NegativeExpansionRule]] = []
+    skipped_structural_rule = 0
+    for rule_index, rule in enumerate(rules):
+        if rule_usable_for_existing_edge_labeling(rule):
+            usable_rule_items.append((rule_index, rule))
+        elif is_structural_negative_e0_rule(rule):
+            skipped_structural_rule += 1
+
+    checked_rows = 0
+    matched_rows = 0
+    exported_rows = 0
+    skipped_positive = 0
+    skipped_existing_negative = 0
+    skipped_label_not_allowed = 0
+    skipped_missing_endpoint = 0
+    duplicate_pairs = 0
+    label_counts: Counter[str] = Counter()
+    seen_pairs: set[tuple[str, str]] = set()
+    output_rows: list[dict[str, str]] = []
+
+    for row in rows:
+        label = normalize_value(row.get(config.label_column))
+        label_counts[label] += 1
+        src, dst = endpoint_ids(row, config.src_column, config.dst_column)
+        if not src or not dst:
+            skipped_missing_endpoint += 1
+            continue
+
+        if (
+            not config.overwrite_existing
+            and not config.allow_positive_relabel
+            and label == "positive"
+        ):
+            skipped_positive += 1
+            continue
+        if (
+            not config.overwrite_existing
+            and not config.allow_existing_negative_relabel
+            and label == config.negative_value
+        ):
+            skipped_existing_negative += 1
+            continue
+        if config.only_labels is not None and label not in config.only_labels:
+            skipped_label_not_allowed += 1
+            continue
+
+        checked_rows += 1
+        context = edge_context(
+            row=row,
+            source_node_attrs=source_node_attrs,
+            target_node_attrs=target_node_attrs,
+            node_degree_bins=node_degree_bins,
+            src_column=config.src_column,
+            dst_column=config.dst_column,
+            similarity_threshold=config.similarity_threshold,
+        )
+
+        matched_rules: list[tuple[int, NegativeExpansionRule]] = []
+        for rule_index, rule in usable_rule_items:
+            if rule_matches(rule, context):
+                matched_rules.append((rule_index, rule))
+
+        if not matched_rules:
+            continue
+        matched_rows += 1
+
+        pair = normalize_pair_for_dataset(src, dst, config.dataset_name)
+        if pair in seen_pairs:
+            duplicate_pairs += 1
+            continue
+        seen_pairs.add(pair)
+
+        first_rule_index, first_rule = matched_rules[0]
+        output_rows.append(
+            {
+                config.src_column: src,
+                config.dst_column: dst,
+                "predicted_label": config.negative_value,
+                "negative_rule_pattern_id": str(first_rule.pattern_id),
+                "negative_rule_index": str(first_rule_index),
+                "matched_rule_count": str(len(matched_rules)),
+                "candidate_source": "existing_edge_labeling",
+                "original_label": label,
+                "negative_rule_antecedent": " & ".join(first_rule.antecedent),
+            }
+        )
+        exported_rows += 1
+
+    config.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with Path(config.output_csv).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                config.src_column,
+                config.dst_column,
+                "predicted_label",
+                "negative_rule_pattern_id",
+                "negative_rule_index",
+                "matched_rule_count",
+                "candidate_source",
+                "original_label",
+                "negative_rule_antecedent",
+            ],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    return {
+        "rows": len(rows),
+        "rules": len(rules),
+        "usable_rules": len(usable_rule_items),
+        "checked_rows": checked_rows,
+        "matched_rows": matched_rows,
+        "exported_rows": exported_rows,
+        "skipped_positive": skipped_positive,
+        "skipped_existing_negative": skipped_existing_negative,
+        "skipped_label_not_allowed": skipped_label_not_allowed,
+        "skipped_missing_endpoint": skipped_missing_endpoint,
+        "skipped_structural_rule": skipped_structural_rule,
+        "duplicate_pairs": duplicate_pairs,
+        "observed_labels": ",".join(f"{label or '<empty>'}:{count}" for label, count in label_counts.most_common(12)),
+    }
+
+
+def expand_body_rematch_non_edges(
+    config: ExpansionConfig,
+    rows: list[dict[str, str]],
+    rules: list[NegativeExpansionRule],
+) -> dict[str, int]:
+    instances_by_pattern = load_pattern_instances(config.pattern_instances_file)
+    pattern_schemas = infer_pattern_schema_from_instances(instances_by_pattern)
+    source_node_attrs = load_node_attrs(str(config.source_node_csv) if config.source_node_csv else None, config.source_node_index_column)
+    target_node_attrs = load_node_attrs(str(config.target_node_csv) if config.target_node_csv else None, config.target_node_index_column)
+    add_degree_bins_to_node_attrs(rows, config.src_column, config.dst_column, source_node_attrs, target_node_attrs)
+
+    edge_records = build_edge_records(rows, config.src_column, config.dst_column, config.dataset_name)
+    existing_pairs = build_existing_edge_set(rows, config.src_column, config.dst_column, config.dataset_name)
+
+    output_rows: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    node_new_counts: Counter[str] = Counter()
+    debug_rules: list[tuple[int, int, tuple[str, ...], dict[str, tuple[str, str]], str]] = []
+
+    body_matches = 0
+    inferred_new_negative_pairs = 0
+    skipped_existing_pair = 0
+    skipped_no_schema = 0
+    skipped_not_expandable = 0
+    skipped_node_limit = 0
+
+    for rule_index, rule in enumerate(rules):
+        if config.max_new_neg_total is not None and inferred_new_negative_pairs >= config.max_new_neg_total:
+            break
+
+        target_edge_var = consequent_target_edge(rule)
+        schema = pattern_schemas.get(rule.pattern_id)
+        if not schema:
+            skipped_no_schema += 1
+            continue
+        if not rule_expandable_by_body_rematch(rule, schema, target_edge_var):
+            skipped_not_expandable += 1
+            continue
+        if len(debug_rules) < 5:
+            debug_rules.append((rule.pattern_id, rule_index, rule.antecedent, schema, target_edge_var))
+
+        target_src_var, target_dst_var = schema[target_edge_var]
+        matches = body_match_backtracking(
+            schema,
+            target_edge_var,
+            rule,
+            edge_records,
+            source_node_attrs,
+            target_node_attrs,
+            config.dataset_name,
+            config.max_body_matches_per_rule,
+        )
+        body_matches += len(matches)
+
+        for match in matches:
+            if config.max_new_neg_total is not None and inferred_new_negative_pairs >= config.max_new_neg_total:
+                break
+            node_binding = match.get("node_binding", {})
+            src = normalize_value(node_binding.get(target_src_var))
+            dst = normalize_value(node_binding.get(target_dst_var))
+            if not src or not dst or src == dst:
+                continue
+
+            pair = normalize_pair_for_dataset(src, dst, config.dataset_name)
+            if pair in existing_pairs:
+                skipped_existing_pair += 1
+                continue
+            if pair in seen_pairs:
+                continue
+            if (
+                node_new_counts[src] >= config.max_new_neg_per_node
+                or node_new_counts[dst] >= config.max_new_neg_per_node
+            ):
+                skipped_node_limit += 1
+                continue
+            if not virtual_e0_literals_hold(rule, src, dst, config.dataset_name):
+                continue
+
+            seen_pairs.add(pair)
+            node_new_counts[src] += 1
+            node_new_counts[dst] += 1
+            output_rows.append(
+                {
+                    config.src_column: src,
+                    config.dst_column: dst,
+                    "predicted_label": config.negative_value,
+                    "negative_rule_pattern_id": str(rule.pattern_id),
+                    "negative_rule_index": str(rule_index),
+                    "target_edge_var": target_edge_var,
+                    "candidate_source": "body_rematch",
+                    "negative_rule_antecedent": " & ".join(rule.antecedent),
+                }
+            )
+            inferred_new_negative_pairs += 1
+
+    config.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with Path(config.output_csv).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                config.src_column,
+                config.dst_column,
+                "predicted_label",
+                "negative_rule_pattern_id",
+                "negative_rule_index",
+                "target_edge_var",
+                "candidate_source",
+                "negative_rule_antecedent",
+            ],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    for pattern_id, rule_index, antecedent, schema, target_edge_var in debug_rules:
+        print(
+            "[BodyRematchRule] "
+            + f"pattern_id={pattern_id} "
+            + f"rule_index={rule_index} "
+            + f"target_edge_var={target_edge_var} "
+            + f"antecedent={antecedent} "
+            + f"schema={schema}"
+        )
+
+    return {
+        "rows": len(rows),
+        "rules": len(rules),
+        "patterns_with_instances": len(instances_by_pattern),
+        "schemas": len(pattern_schemas),
+        "body_matches": body_matches,
+        "inferred_new_negative_pairs": inferred_new_negative_pairs,
+        "skipped_existing_pair": skipped_existing_pair,
+        "skipped_no_schema": skipped_no_schema,
+        "skipped_not_expandable": skipped_not_expandable,
+        "skipped_node_limit": skipped_node_limit,
+    }
+
+
 def expand_negative_edges(config: ExpansionConfig) -> dict[str, int]:
     """导出会被负规则扩展为 negative 的 interaction 端点索引。
 
@@ -749,8 +1388,13 @@ def expand_negative_edges(config: ExpansionConfig) -> dict[str, int]:
     4. 如果满足某条 consequent=negative 的规则，就输出该 interaction 的端点索引。
     """
 
+    if config.expansion_mode == "existing_edge_labeling":
+        return expand_existing_edges_as_negative(config)
+
     rows, _fields = read_rows(str(config.input_csv))
     rules = load_rules(config.rules_file)
+    if config.expansion_mode == "body_rematch_non_edges":
+        return expand_body_rematch_non_edges(config, rows, rules)
     if config.expansion_mode == "candidate_non_edges":
         return expand_candidate_non_edges(config, rows, rules)
     if config.expansion_mode != "matched_existing":

@@ -158,6 +158,7 @@ class GarplusRunConfig:
     node_max_add_edge: int = 4
     max_multi_support: Optional[int] = 10000
     global_rematch_max_instances: Optional[int] = None
+    global_rematch_max_pattern_edges: Optional[int] = None
     global_rematch_target_edge_index: int = 0
     global_rematch_max_instances_per_target_edge: Optional[int] = None
     pattern_dedup_prefer_target_value: Optional[str] = None
@@ -1172,6 +1173,19 @@ def run_demo(cfg: GarplusRunConfig) -> None:
         globally_matched = []
         for item in generated:
             previous_multi_support = item.multi_support()
+            if (
+                cfg.global_rematch_max_pattern_edges is not None
+                and item.pattern.edge_count() > cfg.global_rematch_max_pattern_edges
+            ):
+                globally_matched.append(item)
+                print(
+                    f"[GlobalRematch] pattern_id={item.pattern.pattern_id} kept=True "
+                    f"backend=incremental "
+                    f"incremental_multi={previous_multi_support} global_multi={item.multi_support()} "
+                    f"global_single={item.single_support()} "
+                    f"reason=skip_global_rematch_edges>{cfg.global_rematch_max_pattern_edges}"
+                )
+                continue
             matches = find_matches_with_limit(
                 item.pattern,
                 rematch_graph,
