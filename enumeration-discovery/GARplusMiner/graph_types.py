@@ -310,6 +310,20 @@ def _iter_literal_values(value: object) -> Iterable[object]:
     return [value]
 
 
+def _edge_existing_value(edge: Edge) -> str:
+    """Physical existence flag used as an optional RHS predicate.
+
+    `interaction_label=negative` still means an observed edge with negative
+    semantics. Only explicit missing/synthetic non-edges are marked false.
+    """
+
+    augmented_negative = str(edge.attrs.get("augmented_negative_edge", "")).strip().lower()
+    missing_edge = str(edge.attrs.get("is_missing_edge", "")).strip().lower()
+    if missing_edge in {"yes", "true", "1"} or augmented_negative in {"missing", "non_edge"}:
+        return "false"
+    return "true"
+
+
 def instance_literals(
     graph: DataGraph,
     pattern: GraphPattern,
@@ -337,11 +351,14 @@ def instance_literals(
             src = instance.node_map.get(pattern_edge.src)
             dst = instance.node_map.get(pattern_edge.dst)
             if src is None or dst is None:
+                records.append(LiteralRecord(key="edge_existing", value="false", entity=f"e{pattern_edge_index}"))
                 continue
             matches = graph.find_edges(src, dst, pattern_edge.label)
             if not matches:
+                records.append(LiteralRecord(key="edge_existing", value="false", entity=f"e{pattern_edge_index}"))
                 continue
             edge = matches[0]
+        records.append(LiteralRecord(key="edge_existing", value=_edge_existing_value(edge), entity=f"e{pattern_edge_index}"))
         for key, value in edge.attrs.items():
             for one in _iter_literal_values(value):
                 records.append(LiteralRecord(key=key, value=one, entity=f"e{pattern_edge_index}"))

@@ -121,9 +121,9 @@ DATASET_CONFIGS = {
     "PPI": ExpansionConfig(
         dataset_name="PPI",
         input_csv=DATA_DIR / "protein_protein_signed.csv",
-        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
+        output_csv=PROCESSED_DIR / "ppi" / "rule_negative_pairs_restrict.csv" 
         if (EXPANSION_MODE == "existing_edge_labeling") 
-        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
+        else PROCESSED_DIR / "ppi" / "rule_negative_pairs.csv",
         rules_file=PROCESSED_DIR / "ppi" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ppi" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "protein.csv",
@@ -137,7 +137,7 @@ DATASET_CONFIGS = {
         input_csv=DATA_DIR / "drug_disease_signed.csv",
         output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
         if (EXPANSION_MODE == "existing_edge_labeling") 
-        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
+        else PROCESSED_DIR / "dda" / "rule_negative_pairs_0626.csv",
         rules_file=PROCESSED_DIR / "dda" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "dda" / "pattern_instances.jsonl",
         source_node_csv=DATA_DIR / "drug.csv",
@@ -149,9 +149,9 @@ DATASET_CONFIGS = {
     "TI": ExpansionConfig(
         dataset_name="TI",
         input_csv=DATA_DIR / "gene_disease_signed.csv",
-        output_csv=PROCESSED_DIR / "dda" / "rule_negative_pairs_restrict.csv" 
+        output_csv=PROCESSED_DIR / "ti" / "rule_negative_pairs.csv" 
         if (EXPANSION_MODE == "existing_edge_labeling") 
-        else PROCESSED_DIR / "dda" / "rule_negative_pairs.csv",
+        else PROCESSED_DIR / "ti" / "rule_negative_pairs_0626.csv",
 
         rules_file=PROCESSED_DIR / "ti" / "deduped_rules.txt",
         pattern_instances_file=PROCESSED_DIR / "ti" / "pattern_instances.jsonl",

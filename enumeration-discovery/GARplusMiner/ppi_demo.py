@@ -18,7 +18,7 @@ PROCESSED_DIR = Path(os.environ.get("GARPLUS_PROCESSED_DIR", str(BASE_DIR / "pro
 
 CONFIG = GarplusRunConfig(
     dataset_name="PPI",
-    mode="decision-tree",
+    mode="fp-growth",
     interaction_csv_path=str(DATA_DIR / "protein_protein_signed.csv"),
     node_csv_path=str(DATA_DIR / "protein.csv"),
     node_csv_label="protein_csv",
@@ -35,6 +35,7 @@ CONFIG = GarplusRunConfig(
     predicate_bn_cache_path=str(PROCESSED_DIR / "ppi" / "predicate_bn_negative.pkl"),
     deduped_rules_output_path=str(PROCESSED_DIR / "ppi" / "deduped_rules.txt"),
     include_ml_predicate_targets=False,
+    include_edge_existing_target=True,
     pattern_extension_only=False,
     pattern_extension_debug=False,
     pattern_extension_debug_limit=500,
@@ -57,7 +58,18 @@ CONFIG = GarplusRunConfig(
     max_add_edge=2,
     max_saved_instances_per_pattern=100000,
     filter_degree_predicates=True,
-    ignored_predicate_key_tokens=("interaction_label", "high_degree", "sampled_", "augmented_negative", "direction_role", "edgelabel"),
+    ignored_predicate_key_tokens=(
+        "interaction_label", 
+        "high_degree", 
+        "sampled_", 
+        "augmented_negative", 
+        "direction_role", 
+        "edgelabel",
+        "biogrid_id",
+        "entry",
+        "entry name",
+        "rhea id"
+        ),
     ml_predicates=MLPredicateConfig(
         enabled=True,
         equivalence_threshold=0.80,

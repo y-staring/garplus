@@ -136,6 +136,7 @@ class GarplusRunConfig:
     y_key: str = "e0.interaction_label"
     target_y_keys: Optional[List[str]] = None
     include_ml_predicate_targets: bool = True
+    include_edge_existing_target: bool = False
     pattern_extension_only: bool = False
     pattern_extension_debug: bool = False
     pattern_extension_debug_limit: int = 500
@@ -151,7 +152,7 @@ class GarplusRunConfig:
     full_solution: bool = False
     pattern_support: int = 5
     min_support: int = 50
-    min_confidence: float = 0.6
+    min_confidence: float = 0.7
     min_value_support_count: int = 20
     max_radius: int = 4
     max_add_edge: int = 4
@@ -538,7 +539,7 @@ def print_deduped_rules(pattern_rules, limit: int, output_path: Optional[str] = 
     grouped = {"positive": [], "negative": [], "other": []}
     for row in cover:
         _pattern_id, rule, _key = row
-        value = _rule_consequent_value(rule)
+        value = _rule_consequent_class(rule)
         if value == "positive":
             grouped["positive"].append(row)
         elif value == "negative":
@@ -574,11 +575,20 @@ def _rule_consequent_value(rule: Rule) -> str:
     return rule.consequent.split("=", 1)[1] if "=" in rule.consequent else rule.consequent
 
 
+def _rule_consequent_class(rule: Rule) -> str:
+    value = _rule_consequent_value(rule)
+    if value in {"negative", "false"}:
+        return "negative"
+    if value in {"positive", "true"}:
+        return "positive"
+    return "other"
+
+
 def discovered_rule_table_stats(deduped_rows, pattern_size_by_id: dict) -> dict:
     rules = [rule for _pattern_id, rule, _key in deduped_rows]
     total = len(rules)
-    positive = sum(1 for rule in rules if _rule_consequent_value(rule) == "positive")
-    negative = sum(1 for rule in rules if _rule_consequent_value(rule) == "negative")
+    positive = sum(1 for rule in rules if _rule_consequent_class(rule) == "positive")
+    negative = sum(1 for rule in rules if _rule_consequent_class(rule) == "negative")
     avg_conf = sum(float(rule.confidence) for rule in rules) / total if total else 0.0
     avg_antecedent_size = sum(len(rule.antecedent) for rule in rules) / total if total else 0.0
     avg_pattern_size = (
@@ -695,6 +705,8 @@ def build_target_y_list(graph, cfg: GarplusRunConfig) -> List[str]:
     """Build Go-style yList: each item is mined as one independent RHS."""
 
     candidates = list(cfg.target_y_keys) if cfg.target_y_keys else [cfg.y_key]
+    if cfg.include_edge_existing_target:
+        candidates.append("e0.edge_existing")
     if cfg.include_ml_predicate_targets:
         edge_keys = {key for edge in graph.all_edges() for key in edge.attrs.keys()}
         for key in ("ml_equivalence_pred", "ml_similarity_pred", "ml_pred_ppi", "ml_pred_not_ppi", "ml_offline_predicate_name"):
@@ -713,6 +725,8 @@ def build_target_y_list(graph, cfg: GarplusRunConfig) -> List[str]:
 def predicate_focus_for_y_key(cfg: GarplusRunConfig, y_key: str) -> Optional[str]:
     if y_key == cfg.y_key:
         return cfg.predicate_bn_focus_target
+    if y_key.endswith("edge_existing"):
+        return f"{y_key}=false"
     if (
         y_key.endswith("ml_equivalence_pred")
         or y_key.endswith("ml_similarity_pred")
@@ -750,6 +764,12 @@ def predicate_bn_cache_for_y_key(cfg: GarplusRunConfig, y_key: str, focus_item: 
     if focus_item is not None:
         safe_key = f"{safe_key}_{focus_cache_suffix(focus_item)}"
     return str(path.with_name(f"{path.stem}_{safe_key}{path.suffix}"))
+
+
+def allowed_consequent_values_for_y_key(y_key: str) -> Optional[set[str]]:
+    if y_key.endswith("edge_existing"):
+        return {"false"}
+    return None
 
 
 def drop_edges_by_target_values(
@@ -793,7 +813,12 @@ def print_rule_consequent_distribution(rules: List[Rule]) -> None:
 
 def print_target_rule_diagnostics(selector, target_value: str, limit: int = 20) -> None:
     method_name = f"{target_value}_diagnostics"
-    diagnostics = getattr(selector, method_name)(limit=limit) if hasattr(selector, method_name) else []
+    if hasattr(selector, method_name):
+        diagnostics = getattr(selector, method_name)(limit=limit)
+    elif hasattr(selector, "target_value_diagnostics"):
+        diagnostics = selector.target_value_diagnostics(target_value, limit=limit)
+    else:
+        diagnostics = []
     if not diagnostics:
         print(f"[PredicateSelection] {target_value}_candidate_diagnostics=[]")
         return
@@ -809,6 +834,7 @@ def print_target_rule_diagnostics(selector, target_value: str, limit: int = 20) 
 
 def print_rule_candidate_diagnostics(selector, limit: int = 20) -> None:
     print_target_rule_diagnostics(selector, "negative", limit=limit)
+    print_target_rule_diagnostics(selector, "false", limit=limit)
     print_target_rule_diagnostics(selector, "positive", limit=limit)
 
 
@@ -1350,6 +1376,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         min_value_support_count=cfg.min_value_support_count,
                         predicate_bn=predicate_bn,
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
                         drop_target_entity_features=cfg.drop_target_entity_features,
                         max_depth=cfg.decision_tree_max_depth,
@@ -1370,6 +1397,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         min_value_support_count=cfg.min_value_support_count,
                         predicate_bn=predicate_bn,
                         drop_target_values=set(cfg.ignored_target_values) if cfg.drop_unknown_target_rows else None,
+                        allowed_consequent_values=allowed_consequent_values_for_y_key(y_key),
                         drop_feature_key_tokens=cfg.ignored_predicate_key_tokens if cfg.filter_degree_predicates else None,
                         drop_target_entity_features=cfg.drop_target_entity_features,
                         debug_literal_keys=cfg.debug_literal_keys,
@@ -1415,6 +1443,8 @@ def run_demo(cfg: GarplusRunConfig) -> None:
             print_rule_consequent_distribution(rules)
             if y_key.endswith("interaction_label"):
                 recall_negative_value = "negative"
+            elif y_key.endswith("edge_existing"):
+                recall_negative_value = "false"
             elif y_key.endswith("ml_offline_predicate_name"):
                 recall_negative_value = "ml_pred_not_ppi"
             else:

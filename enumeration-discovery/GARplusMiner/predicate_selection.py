@@ -34,6 +34,7 @@ class PredicateTableMixin:
         self,
         min_value_support_count: int = 1,
         drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         debug_literal_keys: bool = False,
@@ -43,6 +44,7 @@ class PredicateTableMixin:
     ) -> None:
         self.min_value_support_count = max(1, int(min_value_support_count))
         self.drop_target_values = set(drop_target_values or [])
+        self.allowed_consequent_values = {str(value) for value in (allowed_consequent_values or set())}
         self.drop_feature_key_tokens = tuple(token.lower() for token in (drop_feature_key_tokens or ()) if token)
         self.drop_target_entity_features = drop_target_entity_features
         self.debug_literal_keys = debug_literal_keys
@@ -89,6 +91,9 @@ class PredicateTableMixin:
 
     def positive_diagnostics(self, limit: int = 20) -> List[Dict[str, object]]:
         return self.target_value_diagnostics("positive", limit=limit)
+
+    def is_allowed_consequent_value(self, value: object) -> bool:
+        return not self.allowed_consequent_values or str(value) in self.allowed_consequent_values
 
     def build_instance_rows(self, graph: DataGraph, frequent_pattern: FrequentPattern) -> List[Dict[str, object]]:
         """Convert all matched instances of one pattern into row dictionaries."""
@@ -274,7 +279,7 @@ class PredicateTableMixin:
     def filter_feature_keys(self, rows: List[Dict[str, object]], y_key: Optional[str] = None) -> List[Dict[str, object]]:
         """Remove configured shortcut/noisy feature columns from mining rows."""
 
-        if not self.drop_feature_key_tokens:
+        if not self.drop_feature_key_tokens and not self.drop_target_entity_features:
             return rows
         filtered_rows: List[Dict[str, object]] = []
         for row in rows:
@@ -286,6 +291,17 @@ class PredicateTableMixin:
                 filtered_row[key] = value
             filtered_rows.append(filtered_row)
         return filtered_rows
+
+    def print_filtered_literal_keys(self, rows: List[Dict[str, object]]) -> None:
+        if not self.debug_literal_keys or not rows:
+            return
+        keys = sorted({key for row in rows for key in row})
+        v_keys = [key for key in keys if key.startswith("v")]
+        e_keys = [key for key in keys if key.startswith("e")]
+        print(f"[FilteredLiteralKeys] pattern_id={self.current_pattern_id}")
+        print(f"  rows={len(rows)} total_keys={len(keys)} v_keys={len(v_keys)} e_keys={len(e_keys)}")
+        print(f"  v_keys_sample={v_keys[:50]}")
+        print(f"  e_keys_sample={e_keys[:50]}")
 
     def soft_bn_feature_keys(self, rows: List[Dict[str, object]], y_key: str, bn_keys: List[str]) -> List[str]:
         """Use BN ranking as one candidate source instead of a hard feature gate."""
@@ -360,6 +376,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         min_value_support_count: int = 1,
         predicate_bn: Optional[Any] = None,
         drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         max_depth: int = 3,
@@ -371,6 +388,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         super().__init__(
             min_value_support_count=min_value_support_count,
             drop_target_values=drop_target_values,
+            allowed_consequent_values=allowed_consequent_values,
             drop_feature_key_tokens=drop_feature_key_tokens,
             drop_target_entity_features=drop_target_entity_features,
             debug_literal_keys=debug_literal_keys,
@@ -497,6 +515,7 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
         self.print_pattern_label_debug(graph, frequent_pattern, raw_rows, y_key)
         rows = self.prepare_target_rows(raw_rows, y_key)
         rows = self.filter_feature_keys(rows, y_key)
+        self.print_filtered_literal_keys(rows)
         scoring_rows = [row for row in raw_rows if y_key in row]
         scoring_rows = self.filter_target_rows(scoring_rows, y_key)
         scoring_rows = self.filter_feature_keys(scoring_rows, y_key)
@@ -532,6 +551,8 @@ class DecisionTreePredicateSelector(PredicateTableMixin):
             leaf_y_count = Counter(row.get(y_key) for row in matched_rows)
             antecedent_count = len(matched_rows)
             for y_value, pair_count in leaf_y_count.items():
+                if not self.is_allowed_consequent_value(y_value):
+                    continue
                 support = pair_count
                 confidence = pair_count / antecedent_count if antecedent_count else 0.0
                 base_rate = y_count[y_value] / len(scoring_rows)
@@ -568,6 +589,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         min_value_support_count: int = 1,
         predicate_bn: Optional[Any] = None,
         drop_target_values: Optional[set] = None,
+        allowed_consequent_values: Optional[set] = None,
         drop_feature_key_tokens: Optional[tuple[str, ...]] = None,
         drop_target_entity_features: bool = False,
         debug_literal_keys: bool = False,
@@ -578,6 +600,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         super().__init__(
             min_value_support_count=min_value_support_count,
             drop_target_values=drop_target_values,
+            allowed_consequent_values=allowed_consequent_values,
             drop_feature_key_tokens=drop_feature_key_tokens,
             drop_target_entity_features=drop_target_entity_features,
             debug_literal_keys=debug_literal_keys,
@@ -635,6 +658,7 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         self.print_pattern_label_debug(graph, frequent_pattern, raw_rows, y_prefix)
         rows = self.prepare_target_rows(raw_rows, y_prefix)
         rows = self.filter_feature_keys(rows, y_prefix)
+        self.print_filtered_literal_keys(rows)
         if self.predicate_bn is not None:
             self.predicate_bn.fit_rows(rows, y_prefix)
             all_feature_keys = sorted({key for row in rows for key in row.keys() if key != y_prefix})
@@ -664,7 +688,18 @@ class FPGrowthPredicateSelector(PredicateTableMixin):
         for items, itemset_count in itemsets.items():
             if len(items) < 2:
                 continue
-            y_items = [item for item in items if item.startswith(y_prefix)]
+            y_items = [
+                item
+                for item in items
+                if item.startswith(y_prefix)
+                and (
+                    not self.allowed_consequent_values
+                    or (
+                        "=" in item
+                        and item.split("=", 1)[1] in self.allowed_consequent_values
+                    )
+                )
+            ]
             if not y_items:
                 continue
             for consequent in y_items:

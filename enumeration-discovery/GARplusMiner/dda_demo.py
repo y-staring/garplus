@@ -21,6 +21,7 @@ DEBUG_MATCH_EXPANSION = os.environ.get("GARPLUS_DEBUG_MATCH_EXPANSION", "1").str
 DEBUG_TRANSACTION_COST = os.environ.get("GARPLUS_DEBUG_TRANSACTION_COST", "1").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG_SAMPLE_MATCHES = int(os.environ.get("GARPLUS_DEBUG_SAMPLE_MATCHES", "3"))
 
+
 RELATION = RelationGraphConfig(
     relation_name="DDA",
     source_label="Drug",
@@ -34,8 +35,23 @@ RELATION = RelationGraphConfig(
     source_node_index_column="index",
     target_node_index_column="index",
     load_node_attributes=True,
+    excluded_node_attr_columns=(
+        "original_index",
+        "source_node_id",
+        "chemicalid",
+        "chemicalname",
+        "casrn",
+        "synonyms",
+        "description",
+        "drug_interactions",
+        "external_identifiers",
+        "external_links",
+        "general_references",
+        "references",
+        "patents",
+    ),
     # These relation-table columns describe the Drug endpoint, not one interaction.
-    source_edge_attr_columns=("chemicalname", "chemicalid", "casrn"),
+    source_edge_attr_columns=(),
     # These relation-table columns describe the Disease endpoint, not one interaction.
     target_edge_attr_columns=("diseasename", "diseaseid"),
     excluded_edge_attr_columns=("chemical_index", "disease_index", "node_1", "node_2"),
@@ -44,7 +60,7 @@ RELATION = RelationGraphConfig(
 
 CONFIG = GarplusRunConfig(
     dataset_name="DDA",
-    mode="fp-growth", #"",
+    mode="pattern-only" if PATTERN_DEBUG else "decision-tree",
     interaction_csv_path=RELATION.edge_csv_path,
     node_csv_path=None,
     node_csv_label="node_csvs",
@@ -60,8 +76,10 @@ CONFIG = GarplusRunConfig(
     predicate_bn_focus_targets=("negative", "positive"),
     predicate_bn_cache_path=str(PROCESSED_DIR / "dda" / "predicate_bn_negative.pkl"),
     deduped_rules_output_path=str(PROCESSED_DIR / "dda" / "deduped_rules.txt"),
-    enable_target_recall= False,
+    enable_target_recall=False,
+    enable_rule_payload_generation=False,
     include_ml_predicate_targets=False,
+    include_edge_existing_target=True,
     undirected=False,
     undirected_pattern=False,
     max_radius = 2,
@@ -77,7 +95,6 @@ CONFIG = GarplusRunConfig(
     debug_sample_matches=DEBUG_SAMPLE_MATCHES,
     inject_sampled_frequent_patterns=not PATTERN_DEBUG,
     filter_degree_predicates=True,
-    enable_rule_payload_generation=False,
     ignored_predicate_key_tokens=(
         "interaction_label",
         "degree",
@@ -100,6 +117,8 @@ CONFIG = GarplusRunConfig(
         "external_",
         "reference",
         "patents",
+        "groups",
+        "categories"
     ),
     drop_target_entity_features=True,
     ignored_target_values=("unknown", "neutral"),

@@ -17,11 +17,11 @@ from typing import Iterable
 # =========================
 # Edit these paths/settings.
 # =========================
-LLM_EDGE_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/TI_test/data_signed/edges_labeled_with_reason.csv"
-GAR_NEG_EDGE_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/ti/rule_negative_pairs_0626.csv"
-OUTPUT_DIR = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/TI_test/data_signed_0626"
+LLM_EDGE_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed/edges_labeled_with_reason.csv"
+GAR_NEG_EDGE_PATH = "/home/yyyy/codework/GARplus/enumeration-discovery/processed/dda/rule_negative_pairs_0626.csv"
+OUTPUT_DIR = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed"
 
-NODE_CSV_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/TI_test/data_signed/node_labeled.csv"
+NODE_CSV_PATH = "/home/yyyy/codework/GARplus/experiments/exp1_accuracy/DDA_test/data_signed/node_labeled.csv"
 NODE_ID_COL = "node_id"  # e.g. node_id, index, original_index, or source_node_id
 
 

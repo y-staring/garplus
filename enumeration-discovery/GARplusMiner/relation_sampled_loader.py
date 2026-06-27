@@ -40,6 +40,7 @@ class RelationGraphConfig:
     target_node_index_column: str = "index"
     target_node_offset: int = DISEASE_NODE_OFFSET
     load_node_attributes: bool = False
+    excluded_node_attr_columns: Tuple[str, ...] = ()
     source_edge_attr_columns: Tuple[str, ...] = ()
     target_edge_attr_columns: Tuple[str, ...] = ()
     excluded_edge_attr_columns: Tuple[str, ...] = ()
@@ -57,9 +58,16 @@ def _node_kind(orig_id: int, cfg: RelationGraphConfig) -> Tuple[str, int]:
     return cfg.source_label, orig_id
 
 
-def _load_node_attrs(path: Optional[str], label: str, index_column: str = "index", offset: int = 0) -> Dict[int, Vertex]:
+def _load_node_attrs(
+    path: Optional[str],
+    label: str,
+    index_column: str = "index",
+    offset: int = 0,
+    excluded_columns: Tuple[str, ...] = (),
+) -> Dict[int, Vertex]:
     _raise_csv_field_limit()
     result: Dict[int, Vertex] = {}
+    excluded = {_normalize_key(column) for column in excluded_columns}
     if not path or not Path(path).exists():
         return result
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
@@ -71,11 +79,12 @@ def _load_node_attrs(path: Optional[str], label: str, index_column: str = "index
             node_id = int(raw_id) + offset
             attrs = {}
             for column, value in row.items():
-                if column == index_column:
+                key = _normalize_key(column)
+                if column == index_column or key in excluded:
                     continue
                 normalized = _normalize_scalar(value)
                 if normalized is not None:
-                    attrs[_normalize_key(column)] = normalized
+                    attrs[key] = normalized
             result[node_id] = Vertex(id=node_id, label=label, attrs=attrs)
     return result
 
@@ -88,12 +97,14 @@ def _load_relation_node_attrs(cfg: RelationGraphConfig) -> Dict[int, Vertex]:
         cfg.source_label,
         index_column=cfg.source_node_index_column,
         offset=0,
+        excluded_columns=cfg.excluded_node_attr_columns,
     )
     target_attrs = _load_node_attrs(
         cfg.target_node_csv_path,
         cfg.target_label,
         index_column=cfg.target_node_index_column,
         offset=cfg.target_node_offset,
+        excluded_columns=cfg.excluded_node_attr_columns,
     )
     attrs = dict(source_attrs)
     attrs.update(target_attrs)
