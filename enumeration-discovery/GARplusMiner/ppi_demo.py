@@ -18,7 +18,8 @@ PROCESSED_DIR = Path(os.environ.get("GARPLUS_PROCESSED_DIR", str(BASE_DIR / "pro
 
 CONFIG = GarplusRunConfig(
     dataset_name="PPI",
-    mode="fp-growth",
+    mode="decision-tree",
+    decision_tree_max_depth=4,
     interaction_csv_path=str(DATA_DIR / "protein_protein_signed.csv"),
     node_csv_path=str(DATA_DIR / "protein.csv"),
     node_csv_label="protein_csv",

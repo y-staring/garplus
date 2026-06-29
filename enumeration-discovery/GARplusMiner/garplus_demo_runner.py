@@ -133,6 +133,7 @@ class GarplusRunConfig:
     negative_edge_limit: int = 2000
     balance_edge_labels: bool = True
     mode: str = "decision-tree"  # fp-growth
+    fp_growth_max_itemset_size: int = 3
     y_key: str = "e0.interaction_label"
     target_y_keys: Optional[List[str]] = None
     include_ml_predicate_targets: bool = True
@@ -152,7 +153,7 @@ class GarplusRunConfig:
     full_solution: bool = False
     pattern_support: int = 5
     min_support: int = 50
-    min_confidence: float = 0.7
+    min_confidence: float = 0.6
     min_value_support_count: int = 20
     max_radius: int = 4
     max_add_edge: int = 4
@@ -1384,6 +1385,7 @@ def run_demo(cfg: GarplusRunConfig) -> None:
                         debug_literal_instance_limit=cfg.debug_literal_instance_limit,
                         debug_transaction_cost=cfg.debug_transaction_cost,
                         predicate_focus_item=focus_item,
+                        max_itemset_size=cfg.fp_growth_max_itemset_size,
                     )
                     focus_rules = selector.generate_rules(graph, target_pattern, y_key)
                     print(

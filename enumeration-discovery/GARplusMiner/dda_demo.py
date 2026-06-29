@@ -82,6 +82,7 @@ CONFIG = GarplusRunConfig(
     include_edge_existing_target=True,
     undirected=False,
     undirected_pattern=False,
+    decision_tree_max_depth=4,
     max_radius = 2,
     max_add_edge = 2,
     topology_only_pattern_dedup=True,

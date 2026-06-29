@@ -40,7 +40,9 @@ RELATION = RelationGraphConfig(
 
 CONFIG = GarplusRunConfig(
     dataset_name="TI",
-    mode="pattern-only" if PATTERN_DEBUG else "fp-growth",
+    mode="fp-growth",
+    # decision_tree_max_depth=4,
+    fp_growth_max_itemset_size=4,
     interaction_csv_path=RELATION.edge_csv_path,
     node_csv_path=None,
     node_csv_label="node_csvs",
